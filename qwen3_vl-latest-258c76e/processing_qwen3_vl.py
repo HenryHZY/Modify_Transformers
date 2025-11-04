@@ -248,12 +248,15 @@ class Qwen3VLProcessor(ProcessorMixin):
                 if 'image_grid_thw' in image_inputs:
                     vis_grid_thw_b = image_inputs['image_grid_thw'][b]
                     v_pos_mask = input_ids_b == image_token_id
+                    grid_form = 'image'
                 elif 'video_grid_thw' in videos_inputs:
                     vis_grid_thw_b = videos_inputs['video_grid_thw'][b]
                     v_pos_mask = input_ids_b == video_token_id
+                    grid_form = 'video'
                 else:
                     vis_grid_thw_b = None
                     v_pos_mask = None
+                    grid_form = None
 
                 if v_pos_mask is not None:
                     # original boundary
@@ -266,8 +269,16 @@ class Qwen3VLProcessor(ProcessorMixin):
 
                     # visual variables
                     T = vis_grid_thw_b[0].item()
-                    H = vis_grid_thw_b[1].item() // self.image_processor.merge_size # self.config.vision_config.spatial_merge_size # see Qwen2_5_VLPatchMerger
-                    W = vis_grid_thw_b[2].item() // self.image_processor.merge_size # self.config.vision_config.spatial_merge_size # see Qwen2_5_VLPatchMerger
+                    if grid_form == 'image':
+                        H = vis_grid_thw_b[1].item() // self.image_processor.merge_size # self.config.vision_config.spatial_merge_size # see Qwen2_5_VLPatchMerger
+                        W = vis_grid_thw_b[2].item() // self.image_processor.merge_size # self.config.vision_config.spatial_merge_size # see Qwen2_5_VLPatchMerger
+                    elif grid_form == 'video': # Qwen3-VL uses self.video_processor for videos
+                        # For Qwen/Qwen3-VL-8B-Instruct, self.video_processor.merge_size == self.config.vision_config.spatial_merge_size == 2
+                        H = vis_grid_thw_b[1].item() // self.video_processor.merge_size
+                        W = vis_grid_thw_b[2].item() // self.video_processor.merge_size
+                    else:
+                        raise NotImplementedError
+                    
                     token_cnt = H * W
                     token_cnt = token_cnt - token_cnt // 2 # 50%
                     token_cnt = token_cnt - token_cnt // 2 # 25%
