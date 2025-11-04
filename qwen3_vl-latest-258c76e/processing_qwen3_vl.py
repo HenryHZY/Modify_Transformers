@@ -19,7 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Union
-
+import torch
 import numpy as np
 
 from ...feature_extraction_utils import BatchFeature
@@ -226,6 +226,107 @@ class Qwen3VLProcessor(ProcessorMixin):
             mm_token_type_ids[array_ids == self.image_token_id] = 1
             text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
 
+        ############# Token Merging Preparation #############
+        run_our_forward = True
+        if run_our_forward:
+            # variables to be updated
+            input_ids = text_inputs['input_ids'] # (B, L)
+            attention_mask = text_inputs['attention_mask'] # (B, L)
+            pad_token_id = self.tokenizer.convert_tokens_to_ids(self.tokenizer.pad_token)
+            image_token_id = self.tokenizer.convert_tokens_to_ids('<|image_pad|>')
+            video_token_id = self.tokenizer.convert_tokens_to_ids('<|video_pad|>')
+            
+            # perform sample wise operation to support batch inference
+            all_updated_input_ids = []
+            all_updated_attention_masks = []
+            all_updated_boundaries = []
+            for b in range(input_ids.size(0)):
+                input_ids_b = input_ids[b:b+1] # (1, L)
+                attention_mask_b = attention_mask[b:b+1] # (1, L)
+
+                # original variables (per sample)
+                if 'image_grid_thw' in image_inputs:
+                    vis_grid_thw_b = image_inputs['image_grid_thw'][b]
+                    v_pos_mask = input_ids_b == image_token_id
+                elif 'video_grid_thw' in videos_inputs:
+                    vis_grid_thw_b = videos_inputs['video_grid_thw'][b]
+                    v_pos_mask = input_ids_b == video_token_id
+                else:
+                    vis_grid_thw_b = None
+                    v_pos_mask = None
+
+                if v_pos_mask is not None:
+                    # original boundary
+                    first_nonzero_idx = v_pos_mask.float().argmax(dim=1) # (1,)
+                    v_start_idx = first_nonzero_idx.view(1,-1)
+                    n_vis_tokens = (v_pos_mask).sum().item()
+                    q_start_idx = v_start_idx + n_vis_tokens
+                    end_idx_plus = q_start_idx.new_full(q_start_idx.shape, fill_value=input_ids_b[b:b+1].size(1))
+                    boundaries = torch.cat((v_start_idx, q_start_idx, end_idx_plus), dim=1) # (1, 3), [visual token start idx, question token start idx, #tokens] (system promt - visual - question)
+
+                    # visual variables
+                    T = vis_grid_thw_b[0].item()
+                    H = vis_grid_thw_b[1].item() // self.image_processor.merge_size # self.config.vision_config.spatial_merge_size # see Qwen2_5_VLPatchMerger
+                    W = vis_grid_thw_b[2].item() // self.image_processor.merge_size # self.config.vision_config.spatial_merge_size # see Qwen2_5_VLPatchMerger
+                    token_cnt = H * W
+                    token_cnt = token_cnt - token_cnt // 2 # 50%
+                    token_cnt = token_cnt - token_cnt // 2 # 25%
+                    # token_cnt = min(token_cnt, (H // 2) * (W // 2)) # re-assign position ids
+                    reduct_cnt = int(H * W - token_cnt) * T # int(H * W - token_cnt) * T # int(H * W * 0.01) * T # 
+                    
+                    # split input_ids
+                    input_ids_sys = input_ids_b[:, :boundaries[0, 0].item()]
+                    input_ids_vis = input_ids_b[:, boundaries[0, 0].item():boundaries[0, 1].item()][:, reduct_cnt:]
+                    input_ids_q   = input_ids_b[:, boundaries[0, 1].item():]
+                    updated_input_ids_b = torch.cat((input_ids_sys, input_ids_vis, input_ids_q), dim=-1)
+                    # updated_input_ids_b = torch.cat((input_ids_sys, input_ids_q), dim=-1) # visual ids will be injected according to needs
+
+                    # split attention_mask
+                    attention_mask_sys = attention_mask_b[:, :boundaries[0, 0].item()]
+                    attention_mask_vis = attention_mask_b[:, boundaries[0, 0].item():boundaries[0, 1].item()][:, reduct_cnt:]
+                    attention_mask_q   = attention_mask_b[:, boundaries[0, 1].item():]
+                    updated_attention_mask_b = torch.cat((attention_mask_sys, attention_mask_vis, attention_mask_q), dim=-1) # attention_mask[:, :updated_input_ids.size(1)]
+                    # updated_attention_mask_b = torch.cat((attention_mask_sys, attention_mask_q), dim=-1) # visual ids will be injected according to needs
+
+                    # new boundary
+                    boundaries = torch.cat((v_start_idx, q_start_idx - reduct_cnt, end_idx_plus - reduct_cnt), dim=1) # shadow input_ids
+                    # boundaries = torch.cat((v_start_idx, v_start_idx, end_idx_plus - n_vis_tokens), dim=1) # visual ids will be injected according to needs
+                else:
+                    # no visual tokens, leave unchanged
+                    updated_input_ids_b = input_ids_b
+                    updated_attention_mask_b = attention_mask_b
+                all_updated_input_ids.append(updated_input_ids_b)
+                all_updated_attention_masks.append(updated_attention_mask_b)
+                all_updated_boundaries.append(boundaries)
+
+            # find max length among all sequences
+            max_len = max(x.size(1) for x in all_updated_input_ids)
+            # left pad input_ids
+            padded_input_ids = []
+            for ids in all_updated_input_ids:
+                pad_len = max_len - ids.size(1)
+                padded = torch.cat([torch.full((1,pad_len), pad_token_id, dtype=ids.dtype, device=ids.device), ids], dim=1) # left pad
+                padded_input_ids.append(padded)
+            text_inputs['input_ids'] = torch.cat(padded_input_ids, dim=0)
+            # left pad attention_mask
+            padded_attention_masks = []
+            for mask in all_updated_attention_masks:
+                pad_len = max_len - mask.size(1)
+                padded = torch.cat([torch.zeros((1,pad_len), dtype=mask.dtype, device=mask.device), mask], dim=1) # left pad
+                padded_attention_masks.append(padded)
+            text_inputs['attention_mask'] = torch.cat(padded_attention_masks, dim=0)
+            # adjust boundaries
+            adjusted_boundaries = torch.zeros((input_ids.size(0), 3), dtype=boundaries.dtype, device=boundaries.device)
+            for b_i, ids in enumerate(all_updated_input_ids):
+                pad_len = max_len - ids.size(1)
+                adjusted_boundaries[b_i, 0] = all_updated_boundaries[b_i][0, 0] + pad_len # instruction token move right due to padding
+                adjusted_boundaries[b_i, 1] = all_updated_boundaries[b_i][0, 1] + pad_len # question tokens move right (padding)
+                adjusted_boundaries[b_i, 2] = all_updated_boundaries[b_i][0, 2] + pad_len # end+1 token move right (padding)
+            text_inputs['preprocess_boundaries'] = adjusted_boundaries
+        else:
+            text_inputs['preprocess_boundaries'] = None
+        ############# Token Merging Preparation #############
+        
         return BatchFeature(data={**text_inputs, **image_inputs, **videos_inputs}, tensor_type=return_tensors)
 
     def _get_num_multimodal_tokens(self, image_sizes=None, video_sizes=None, **kwargs):
