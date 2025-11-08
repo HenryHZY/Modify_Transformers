@@ -1484,6 +1484,14 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         def _expand_dict_for_generation_visual(dict_to_expand):
             image_grid_thw = model_kwargs.get("image_grid_thw", None)
             video_grid_thw = model_kwargs.get("video_grid_thw", None)
+            
+            ###### TODO: fix_zy: qwen3vl use num_return_sequences > 1, refer to https://github.com/QwenLM/Qwen3-VL/issues/1621
+            # flatten video grid thw to 1D tensor
+            if video_grid_thw is not None:
+                video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+                video_grid_thw[:, 0] = 1
+            ###### 
+            
             image_nums, video_nums = self._get_image_nums_and_video_nums(
                 input_ids, inputs_embeds=model_kwargs.get("inputs_embeds", None)
             )
@@ -1517,6 +1525,12 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
                     )
                 elif key == "video_grid_thw":
                     lengths = list(video_nums)
+                    
+                    ###### TODO: fix_zy: qwen3vl use num_return_sequences > 1, refer to https://github.com/QwenLM/Qwen3-VL/issues/1621
+                    dict_to_expand[key] = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+                    dict_to_expand[key][:, 0] = 1
+                    ######
+                    
                     dict_to_expand[key] = _repeat_interleave_samples(
                         dict_to_expand[key], lengths=lengths, repeat_times=expand_size
                     )
