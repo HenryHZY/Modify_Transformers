@@ -1190,8 +1190,8 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         next_decoder_cache = None
 
         ############# Token Merging with Pre-computed Input IDs #############
-        is_prefill = past_key_values is None or past_key_values.get_seq_length() == 0
-        rl_forward = is_prefill and attention_mask is None
+        is_prefill = past_key_values is None or past_key_values.get_seq_length() == 0 # denote prefill stage
+        rl_forward = is_prefill and attention_mask is None # denote rl_forward get per token prob
         if is_prefill:
             if vis_grid_thw is None: # this case doesn't exist, should be removed
                 pass
@@ -1231,7 +1231,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
         ############# token pruning #############
         
-        for decoder_layer in self.layers:
+        for decoder_layer in self.layers: # LLM开始, each layer
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             
@@ -1259,13 +1259,22 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                     position_embeddings=position_embeddings,
                 )
 
-            hidden_states = layer_outputs[0]
+            hidden_states = layer_outputs[0] # get final output of layer i, 1234~1262没改token compression
 
             ############# token pruning #############
-            importance_score = layer_outputs[-1]
-            if run_our_forward:
-                if importance_score is None: # no importance_score (flash attn layer)
-                    if not only_edit_mask:
+            importance_score = layer_outputs[-1] 
+            if run_our_forward: # 开始选token, key tokens, score = attn_w，具体计算有现成func 
+                # generate, 第一次forward prefill，第二次forward decode 
+                # prefill: condition input -> kvcache 
+                # decode第一个 len(input)=1
+                # decode: kvcache + cur -> next pred
+                # will update kvcache -> attn.shape add 1, also for cache_pos
+                # batch操作：每层先要减k个token -> 最后再+1 (next pred) -> batch padding (由于每行数量不定，但是实际上一般都是bs=1，不过code有支持bs>1)
+                
+                # 对于强化学习，generate也是prefill + decode，
+                # 然后get per log at prefill stage
+                if importance_score is None: # no importance_score (flash attn layer) # 只有部分layer做pruning，初始化会定义好需要pruning的layer # 这个用flash attn
+                    if not only_edit_mask: # 有些是flash attn，有些是eager attn，为了对齐，输入输出不太一样【如果是纯eager，会OOM】
                         if is_prefill: # prefill phrase or RL stage get_per_token_logps()
                             self.attention_mask_cache[layer_idx + 1] = attention_mask
                             self.position_ids_cache[layer_idx + 1] = position_ids
@@ -1313,13 +1322,13 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                             self.cache_position_cache[layer_idx + 1] = cache_position # [item.shape[2] for item in self.position_ids_cache], self.position_ids_cache[0], self.position_ids_cache[-1] 
                             self.position_ids_cache[layer_idx + 1] = position_ids # [item[-1] for item in self.cache_position_cache]
                             self.boundaries_cache[layer_idx + 1][:, 2] += 1 # self.boundaries_cache, boundary at each layer keeps the same, except that the seq length + 1
-                else: # do pruning
+                else: # do pruning # 有pruning的需要用eager mode attn
                     if importance_score == 'decoding': # decoding phrase
-                        if only_edit_mask:
+                        if only_edit_mask: # always false, not used? if run our forward 之前的实现了
                             cache_att_mask = self.attention_mask_cache[layer_idx + 1] # the cached attention mask of this layer
                             attention_mask[:, :cache_att_mask.shape[-1]] = cache_att_mask # overwrite the part of prefill stage
                             causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
-                        else: # append new token
+                        else: # append new token # 为了一个新token，并且真的丢掉
                             # get variables of next layer from prefill cache
                             attention_mask = self.attention_mask_cache[layer_idx + 1] 
                             position_ids = self.position_ids_cache[layer_idx + 1] 
@@ -1357,7 +1366,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                             self.position_ids_cache[layer_idx + 1] = position_ids # [item[-1] for item in self.cache_position_cache]
                             self.boundaries_cache[layer_idx + 1][:, 2] += 1 # self.boundaries_cache, boundary at each layer keeps the same, except that the seq length + 1
                     else: # prefill phrase                             
-                        if only_edit_mask:
+                        if only_edit_mask: # false，旧实现
                             # set scores to negative for the tokens that were already masked out in previous layers & set scores to 1.0 for text tokens that should be protected
                             masked_tokens = (attention_mask == False).nonzero() # attention_mask: (B, N)
                             importance_score[masked_tokens[:, 0], masked_tokens[:, 1]] = -1.0 # importance_score: (B, N)
@@ -1388,7 +1397,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                             chosen_attention_masks = []
                             chosen_position_ids = []
                             batch_gumbel_noises = []
-                            if not learnable_prune: # prune tokens based on importance score
+                            if not learnable_prune: # prune tokens based on importance score # false，old实现
                                 # set scores to 1.0 for text tokens that should be protected
                                 keep_num = (v_cnt_before_llm * self.retain_rate[layer_idx]).long() + protected_num # (importance_score.shape[1] - protected_num) * self.retain_rate[layer_idx] + protected_num
                                 importance_score[protected_inds[:, 0], protected_inds[:, 1]] = 1.0 # importance_score: (B, N)
@@ -2133,11 +2142,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         all_raw_attention_masks = []
         boundaries = None
         vis_grid_thw = None
-        if inputs_embeds is None:
+        if inputs_embeds is None: # 核心的token merging # LLM
             inputs_embeds = self.model.embed_tokens(input_ids) # self.model.embed_tokens.weight[151644], torch.isnan(self.model.layers[7].mlp.down_proj.weight).any().item()
             # if torch.isnan(inputs_embeds).any().item():
             #     import pdb; pdb.set_trace()
-            if pixel_values is not None: # prefilling stage or RL stage get_per_token_logps()
+            if pixel_values is not None: # prefilling stage or RL stage get_per_token_logps() # 图片和video操作基本一致，似乎直接复制就行
                 if not run_our_forward:
                     pixel_values = pixel_values.type(self.visual.dtype)
                     image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -2263,7 +2272,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
                     video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                     inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
-                else:
+                else: # processing要先预先处理，无feature操作
                     pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
                     video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
                     n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
@@ -2287,7 +2296,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                         H = vis_grid_thw_b[1].item() // self.config.vision_config.spatial_merge_size # see Qwen2_5_VLPatchMerger
                         W = vis_grid_thw_b[2].item() // self.config.vision_config.spatial_merge_size # see Qwen2_5_VLPatchMerger
                         C = inputs_embeds.size(-1)
-                        vis_feats = einops.rearrange(encoder_vis_embeds_b[0], "(T H W) C -> T (H W) C", T=T, H=H) # encoder_vis_embeds_b[0] # 
+                        vis_feats = einops.rearrange(encoder_vis_embeds_b[0], "(T H W) C -> T (H W) C", T=T, H=H) # encoder_vis_embeds_b[0] # 最关键？
                         token_idx = torch.arange(T * H * W, device=vis_feats.device).reshape(T, -1, 1) # (T, H, W) the index covers the whole video 
                         # vis_feats, token_idx = bipartite_soft_matching_merge(metric=vis_feats, r=int(vis_feats.shape[1] * 0.01), x=vis_feats, token_idx=token_idx) # 99%
                         vis_feats, token_idx = bipartite_soft_matching_merge(metric=vis_feats, r=vis_feats.shape[1]//2, x=vis_feats, token_idx=token_idx) # 50%
@@ -2296,7 +2305,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                         # if difference > 0: # re-assign position ids
                             # vis_feats, token_idx = bipartite_soft_matching_merge(metric=vis_feats, r=difference, x=vis_feats, token_idx=token_idx) # re-assign position ids
                         # the visual embeddings and indices after merging
-                        token_idx = token_idx.reshape(-1) # the indices within visual token scope
+                        token_idx = token_idx.reshape(-1) # the indices within visual token scope # 记录被保留的token -> 为了后面算pos -> 恢复为原本的pos
                         vis_embeds = vis_feats.reshape(-1, C).unsqueeze(0) # assumption
 
                         # boundary of tokens for this sample
@@ -2343,7 +2352,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                             q_attnmask   = attention_mask[b:b+1, q_tok_start_idx:]
                             raw_vis_attnmask = torch.full((1, T * H * W), 1, dtype=attention_mask.dtype, device=attention_mask.device)
                             raw_attention_mask_b = torch.cat((sys_attnmask, raw_vis_attnmask, q_attnmask), dim=1)
-                        else: # RL stage get_per_token_logps()
+                        else: # RL stage get_per_token_logps() # prefill内有个子分支关于RL
                             raw_attention_mask_b = None
                         all_raw_attention_masks.append(raw_attention_mask_b)
                     
@@ -2356,15 +2365,15 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
-        # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
-        if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
+        # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme # 获取new pos emb
+        if position_ids is None and (attention_mask is None or attention_mask.ndim == 2): # 辅助token merging，特别是pos emd update&modify
             # calculate RoPE index once per generation in the pre-fill stage only
             if (
                 (cache_position is not None and cache_position[0] == 0)
                 or self.rope_deltas is None
                 or (past_key_values is None or past_key_values.get_seq_length() == 0)
             ): # prefill stage
-                if len(all_raw_input_ids) == 0: # original network forward
+                if len(all_raw_input_ids) == 0: # original network forward # 原本的
                     position_ids, rope_deltas = self.get_rope_index(
                         input_ids,
                         image_grid_thw,
@@ -2393,12 +2402,12 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                         q_tok_start_idx = boundary_b[0, 1].item() # assumption
                         q_tok_start_idx += reduct_cnt # recover to the length before token compression
                         
-                        # NOTE: to avoid the generated tokens involving image/video tokens, replace them with others temporily in get_rope_index() function
+                        # NOTE: to avoid the generated tokens involving image/video tokens, replace them with others temporily in get_rope_index() function # 为了防止一些corner case
                         temp_input_ids = raw_input_ids
                         if raw_attention_mask is None: # RL stage get_per_token_logps()
                             sys_vis_ids = raw_input_ids[:, :q_tok_start_idx] # system & visual tokens
                             q_completion_ids = raw_input_ids[:, q_tok_start_idx:] # question tokens & completion tokens
-                            has_img_id = q_completion_ids == self.config.image_token_id
+                            has_img_id = q_completion_ids == self.config.image_token_id # 因为RL有时候生成img or vid id
                             has_vid_id = q_completion_ids == self.config.video_token_id
                             if (has_img_id).any().item():
                                 print('Edit tensors ({} image_token_id) for get_rope_index() function!'.format(torch.nonzero(has_img_id).shape[0]))
@@ -2410,7 +2419,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                         
                         # compute position_ids & rope_deltas
                         # video_grid_thw[b:b+1][0, 1:] = video_grid_thw[b:b+1][0, 1:] // 2 # re-assign position ids
-                        position_ids_b, rope_deltas_b = self.get_rope_index(
+                        position_ids_b, rope_deltas_b = self.get_rope_index( # follow原本的操作，shadow一下input 
                             input_ids=temp_input_ids,
                             image_grid_thw=image_grid_thw if image_grid_thw is None else image_grid_thw[b:b+1],
                             video_grid_thw=video_grid_thw if video_grid_thw is None else video_grid_thw[b:b+1],
@@ -2420,8 +2429,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                         # NOTE: the delta was computed w.r.t. original long sequence and now should be translated w.r.t. compressed sequence
                         # Compressed sequences in a batch have the same length (same cache_position), while raw sequences could have different length (different reduct_cnt & rope_deltas)
                         # Add reduct_cnt to recover raw sequence domain and then apply rope_deltas to cache_position accordingly.
-                        rope_deltas_b = rope_deltas_b + reduct_cnt
-                        rope_deltas.append(rope_deltas_b)
+                        rope_deltas_b = rope_deltas_b + reduct_cnt # 性能十分受影响，如果没实现好的话
+                        rope_deltas.append(rope_deltas_b) # TODO：Pruning会使用上，因为生成新tokens -> 重新算pos 类似于pos offset
 
                         # index postional ids
                         sys_position_ids = position_ids_b[:, :, :vis_tok_start_idx]
@@ -2448,7 +2457,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
         
-        outputs = self.model(
+        outputs = self.model( # 把merge后的token放进LLM 1/4 num tokens
             input_ids=None,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -2470,7 +2479,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         loss = None
         updated_labels = None
         if labels is not None:
-            if run_our_forward:
+            if run_our_forward: # 零散的辅助操作，比如modify data type
                 ##### NOTE: assume batch as 1 per device during training
                 assert labels.shape[0] == 1
                 first_layer_input_b = self.model.boundaries_cache[0][0]

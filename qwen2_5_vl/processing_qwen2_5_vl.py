@@ -215,7 +215,8 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
                     q_start_idx = v_start_idx + n_vis_tokens
                     end_idx_plus = q_start_idx.new_full(q_start_idx.shape, fill_value=input_ids_b[b:b+1].size(1))
                     boundaries = torch.cat((v_start_idx, q_start_idx, end_idx_plus), dim=1) # (1, 3), [visual token start idx, question token start idx, #tokens] (system promt - visual - question)
-
+                    # 考虑第一个值换成<x.y seconds>
+                    
                     # visual variables
                     T = vis_grid_thw_b[0].item()
                     H = vis_grid_thw_b[1].item() // self.image_processor.merge_size # self.config.vision_config.spatial_merge_size # see Qwen2_5_VLPatchMerger
