@@ -1081,8 +1081,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         ############# token pruning #############
         self.run_our_forward = True
         self.learnable_prune = False
-        self.gumbel_sigmoid = False
-        self.keep_pruned_toks = False
         self.only_edit_mask = False
         if not self.run_our_forward:
             self.layers = nn.ModuleList([Qwen2_5_VLDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
@@ -1324,47 +1322,43 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                             self.boundaries_cache[layer_idx + 1][:, 2] += 1 # self.boundaries_cache, boundary at each layer keeps the same, except that the seq length + 1
                 else: # do pruning # 有pruning的需要用eager mode attn
                     if importance_score == 'decoding': # decoding phrase
-                        if only_edit_mask: # always false, not used? if run our forward 之前的实现了
-                            cache_att_mask = self.attention_mask_cache[layer_idx + 1] # the cached attention mask of this layer
-                            attention_mask[:, :cache_att_mask.shape[-1]] = cache_att_mask # overwrite the part of prefill stage
-                            causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
-                        else: # append new token # 为了一个新token，并且真的丢掉
-                            # get variables of next layer from prefill cache
-                            attention_mask = self.attention_mask_cache[layer_idx + 1] 
-                            position_ids = self.position_ids_cache[layer_idx + 1] 
-                            cache_position = self.cache_position_cache[layer_idx + 1] 
-                            boundaries = self.boundaries_cache[layer_idx + 1]
+                        # append new token # 为了一个新token，并且真的丢掉
+                        # get variables of next layer from prefill cache
+                        attention_mask = self.attention_mask_cache[layer_idx + 1] 
+                        position_ids = self.position_ids_cache[layer_idx + 1] 
+                        cache_position = self.cache_position_cache[layer_idx + 1] 
+                        boundaries = self.boundaries_cache[layer_idx + 1]
 
-                            # convert variables to decoding stage (usually one input token)
-                            batch_size, seq_length, _ = hidden_states.shape
-                            attention_mask = torch.cat((attention_mask, attention_mask.new_full((attention_mask.shape[0], seq_length), fill_value=1)), dim=-1) # append mask for the input token
-                            cache_position = torch.arange(seq_length, device=cache_position.device) + cache_position[-1].item() + 1 # cache position for input token
-                            # NOTE: cache_position value would decrease as layer goes deeper, yet position_ids should keep increasing as if there was no token compression
-                            reduct_cnt = (self.boundaries_cache[layer_idx] - self.boundaries_cache[layer_idx + 1])[:, 1:2]
-                            running_rope_deltas += reduct_cnt
-                            delta = ((cache_position[0] + running_rope_deltas).to(hidden_states.device) if cache_position is not None else 0)
-                            position_ids = torch.arange(seq_length, device=hidden_states.device)
-                            position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-                            if cache_position is not None:  # otherwise `deltas` is an int `0`
-                                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
-                            position_ids = position_ids.add(delta)
-                            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+                        # convert variables to decoding stage (usually one input token)
+                        batch_size, seq_length, _ = hidden_states.shape
+                        attention_mask = torch.cat((attention_mask, attention_mask.new_full((attention_mask.shape[0], seq_length), fill_value=1)), dim=-1) # append mask for the input token
+                        cache_position = torch.arange(seq_length, device=cache_position.device) + cache_position[-1].item() + 1 # cache position for input token
+                        # NOTE: cache_position value would decrease as layer goes deeper, yet position_ids should keep increasing as if there was no token compression
+                        reduct_cnt = (self.boundaries_cache[layer_idx] - self.boundaries_cache[layer_idx + 1])[:, 1:2]
+                        running_rope_deltas += reduct_cnt
+                        delta = ((cache_position[0] + running_rope_deltas).to(hidden_states.device) if cache_position is not None else 0)
+                        position_ids = torch.arange(seq_length, device=hidden_states.device)
+                        position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+                        if cache_position is not None:  # otherwise `deltas` is an int `0`
+                            delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+                        position_ids = position_ids.add(delta)
+                        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-                            # re-compute for next layer
-                            # causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
-                            if (layer_idx + 1) < len(self.layers):
-                                if self.layers[layer_idx + 1].self_attn_type != 'eager': # layer transition: recompute mask for next layer (flash attn type)
-                                    causal_mask = causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions)
-                                else: # continue to be eager layer type
-                                    causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
-                            position_embeddings = self.rotary_emb(hidden_states, position_ids) # computed w.r.t. position_ids values, irrelevant to hidden_states values
-                            # protected_inds, protected_num = get_protected_info(boundaries, hidden_states) # not used in decoding
+                        # re-compute for next layer
+                        # causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
+                        if (layer_idx + 1) < len(self.layers):
+                            if self.layers[layer_idx + 1].self_attn_type != 'eager': # layer transition: recompute mask for next layer (flash attn type)
+                                causal_mask = causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions)
+                            else: # continue to be eager layer type
+                                causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
+                        position_embeddings = self.rotary_emb(hidden_states, position_ids) # computed w.r.t. position_ids values, irrelevant to hidden_states values
+                        # protected_inds, protected_num = get_protected_info(boundaries, hidden_states) # not used in decoding
 
-                            # update cache for next token input
-                            self.attention_mask_cache[layer_idx + 1] = attention_mask # [item.shape[1] for item in self.attention_mask_cache]
-                            self.cache_position_cache[layer_idx + 1] = cache_position # [item.shape[2] for item in self.position_ids_cache], self.position_ids_cache[0], self.position_ids_cache[-1] 
-                            self.position_ids_cache[layer_idx + 1] = position_ids # [item[-1] for item in self.cache_position_cache]
-                            self.boundaries_cache[layer_idx + 1][:, 2] += 1 # self.boundaries_cache, boundary at each layer keeps the same, except that the seq length + 1
+                        # update cache for next token input
+                        self.attention_mask_cache[layer_idx + 1] = attention_mask # [item.shape[1] for item in self.attention_mask_cache]
+                        self.cache_position_cache[layer_idx + 1] = cache_position # [item.shape[2] for item in self.position_ids_cache], self.position_ids_cache[0], self.position_ids_cache[-1] 
+                        self.position_ids_cache[layer_idx + 1] = position_ids # [item[-1] for item in self.cache_position_cache]
+                        self.boundaries_cache[layer_idx + 1][:, 2] += 1 # self.boundaries_cache, boundary at each layer keeps the same, except that the seq length + 1
                     else: # prefill phrase                             
                         if only_edit_mask: # false，旧实现
                             # set scores to negative for the tokens that were already masked out in previous layers & set scores to 1.0 for text tokens that should be protected
@@ -1397,7 +1391,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                             chosen_attention_masks = []
                             chosen_position_ids = []
                             batch_gumbel_noises = []
-                            if not learnable_prune: # prune tokens based on importance score # false，old实现
+                            if not learnable_prune: # prune tokens based on importance score # learnable是false，old实现
                                 # set scores to 1.0 for text tokens that should be protected
                                 keep_num = (v_cnt_before_llm * self.retain_rate[layer_idx]).long() + protected_num # (importance_score.shape[1] - protected_num) * self.retain_rate[layer_idx] + protected_num
                                 importance_score[protected_inds[:, 0], protected_inds[:, 1]] = 1.0 # importance_score: (B, N)
@@ -1415,74 +1409,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                                     chosen_hidden_states.append(hidden_states_b)
                                     chosen_attention_masks.append(attention_mask_b)
                                     chosen_position_ids.append(position_ids_b)       
-                            else: # prune tokens based on learnable sampling
-                                for b_i in range(hidden_states.size(0)):
-                                    # get token boundary [system prompt text tokens, visual tokens, question tokens]
-                                    vis_tok_start_idx = boundaries[b_i, 0].item()
-                                    q_tok_start_idx = boundaries[b_i, 1].item()
-
-                                    # slice tokens into chunks
-                                    vis_scores = importance_score[b_i:b_i+1, vis_tok_start_idx:q_tok_start_idx]
-                                    vis_states = hidden_states[b_i:b_i+1, vis_tok_start_idx:q_tok_start_idx]
-                                    vis_attnmask = attention_mask[b_i:b_i+1, vis_tok_start_idx:q_tok_start_idx] if attention_mask is not None else None
-                                    vis_position_ids = position_ids[:, b_i:b_i+1, vis_tok_start_idx:q_tok_start_idx]
-                                    
-                                    if self.gumbel_sigmoid: # perform Gumbel-Softmax and select visual tokens (NOTE: do sigmoid-binary selection)
-                                        keep_num = int(v_cnt_before_llm[b_i].item() * self.retain_rate[layer_idx]) # int((importance_score.shape[1] - protected_num[b_i].item()) * self.retain_rate[layer_idx])
-                                        if rl_forward: # recover the sampled variable from previous feedforward
-                                            gumbel_mask, gumbel_noises = gumbel_sigmoid(vis_scores, k=keep_num, hard=True, gumbel_noises=self.gumbel_noise_cache[layer_idx][b_i])
-                                        else: # the first time of feedforward, sample variable from distribution
-                                            gumbel_mask, gumbel_noises = gumbel_sigmoid(vis_scores, k=keep_num, hard=True)
-                                        gumbel_mask_expanded = gumbel_mask.unsqueeze(-1).expand_as(vis_states)
-                                        vis_states = gumbel_mask_expanded.to(dtype=vis_states.dtype) * vis_states # involve gumbel variable into computation graph
-                                        if self.keep_pruned_toks and self.training: # gradients flow through both "1" and "0" tokens
-                                            selected_vis_states = vis_states
-                                            selected_vis_attnmask = vis_attnmask if attention_mask is not None else None
-                                            selected_vis_position_ids = vis_position_ids
-                                        else: # gradients only flow through "1" tokens
-                                            keep_inds = gumbel_mask[0].nonzero()[:, 0] # gumbel_mask[0].detach().bool()                                    
-                                            selected_vis_states = vis_states[:, keep_inds, :]
-                                            selected_vis_attnmask = vis_attnmask[:, keep_inds] if attention_mask is not None else None
-                                            selected_vis_position_ids = vis_position_ids[:, :, keep_inds]
-                                    else: # perform Gumbel-Softmax and select visual tokens
-                                        keep_num = int((importance_score.shape[1] - protected_num[b_i].item()) * self.retain_rate[layer_idx])
-                                        if rl_forward: # recover the sampled variable from previous feedforward
-                                            gumbel_mask, gumbel_noises = gumbel_softmax(vis_scores, k=keep_num, hard=True, gumbel_noises=self.gumbel_noise_cache[layer_idx][b_i])
-                                        else: # the first time of feedforward, sample variable from distribution
-                                            gumbel_mask, gumbel_noises = gumbel_softmax(vis_scores, k=keep_num, hard=True)
-                                        gumbel_mask_expanded = gumbel_mask.unsqueeze(-1).expand_as(vis_states)
-                                        vis_states = gumbel_mask_expanded.to(dtype=vis_states.dtype) * vis_states # involve gumbel variable into computation graph
-                                        if self.keep_pruned_toks and self.training: # gradients flow through both "1" and "0" tokens
-                                            selected_vis_states = vis_states
-                                            selected_vis_attnmask = vis_attnmask if attention_mask is not None else None
-                                            selected_vis_position_ids = vis_position_ids
-                                        else: # gradients only flow through "1" tokens
-                                            keep_inds = gumbel_mask[0].nonzero()[:, 0] # gumbel_mask[0].detach().bool()                                    
-                                            selected_vis_states = vis_states[:, keep_inds, :]
-                                            selected_vis_attnmask = vis_attnmask[:, keep_inds] if attention_mask is not None else None
-                                            selected_vis_position_ids = vis_position_ids[:, :, keep_inds]
-
-                                    # perform Gumbel-Softmax and select visual tokens (NOTE: keep un-selected tokens for gradient propagation)
-                                    # keep_num = int((importance_score.shape[1] - protected_num[b_i].item()) * self.retain_rate[layer_idx])
-                                    # if rl_forward: # recover the sampled variable from previous feedforward
-                                    #     gumbel_mask, gumbel_noises = gumbel_softmax(vis_scores, k=keep_num, hard=True, gumbel_noises=self.gumbel_noise_cache[layer_idx][b_i])
-                                    # else: # the first time of feedforward, sample variable from distribution
-                                    #     gumbel_mask, gumbel_noises = gumbel_softmax(vis_scores, k=keep_num, hard=True)
-                                    # gumbel_mask_expanded = gumbel_mask.unsqueeze(-1).expand_as(vis_states)
-                                    # vis_states = gumbel_mask_expanded.to(dtype=vis_states.dtype) * vis_states # involve gumbel variable into computation graph
-                                    # selected_vis_states = vis_states
-                                    # selected_vis_attnmask = vis_attnmask if attention_mask is not None else None
-                                    # selected_vis_position_ids = vis_position_ids
-
-                                    # concat chosen tokens
-                                    hidden_states_b = torch.cat((hidden_states[b_i:b_i+1, :vis_tok_start_idx], selected_vis_states, hidden_states[b_i:b_i+1, q_tok_start_idx:]), dim=-2) # (1, N, C)
-                                    attention_mask_b = torch.cat((attention_mask[b_i:b_i+1, :vis_tok_start_idx], selected_vis_attnmask, attention_mask[b_i:b_i+1, q_tok_start_idx:]), dim=-1) if attention_mask is not None else None # (1, N)
-                                    position_ids_b = torch.cat((position_ids[:, b_i:b_i+1, :vis_tok_start_idx], selected_vis_position_ids, position_ids[:, b_i:b_i+1, q_tok_start_idx:]), dim=-1) # (3, 1, N)
-                                    chosen_hidden_states.append(hidden_states_b)
-                                    chosen_attention_masks.append(attention_mask_b)
-                                    chosen_position_ids.append(position_ids_b)    
-                                    batch_gumbel_noises.append(gumbel_noises)
-                                self.gumbel_noise_cache[layer_idx] = batch_gumbel_noises
 
                             # find max length among all samples in the batch
                             max_len = max(x.size(1) for x in chosen_hidden_states)
@@ -2785,29 +2711,6 @@ def get_protected_info(boundaries, hidden_states):
 
     return protected_inds, protected_num
 
-def gen_gumbel_noise(shape, device=None, eps=1e-10):
-    U = torch.rand(shape, device=device)
-    return -torch.log(-torch.log(U + eps) + eps)
-
-def get_importance_original(attention_score, tau_imp=0.1, iters=10, d=0.):
-    """ Given attention logits (before softmax & already processed by casual mask), run page rank algorithm to compute importance scores.
-    """
-    attn = attention_score.clone().detach().to(torch.float32)
-    B,H,N,_ = attn.shape  
-    M = nn.functional.softmax(attn / tau_imp, dim=-1, dtype=torch.float32) # .to(attn.dtype) # softmax with a temperature
-
-    # page rank
-    dist = torch.ones(B,H,1,N).to(M.device, M.dtype) / N
-    for i in range(iters):
-        dist = (dist@M)*(1-d) + d/N   ## smoothing the iterations
-    
-    # square to magnify importance
-    dist = torch.mean(dist.pow(2),dim=1).pow(0.5)
-
-    # return score
-    importance = dist.view(B, N) 
-    return importance
-
 def get_importance(attention_score, tau_imp=0.1, iters=10, d=0.):
     """ Given attention logits (before softmax & already processed by casual mask), run page rank algorithm to compute importance scores.
     """
@@ -2827,76 +2730,6 @@ def get_importance(attention_score, tau_imp=0.1, iters=10, d=0.):
     # return score
     importance = dist.view(B, N) 
     return importance
-
-def get_importance_logits(attention_score):
-    """ Given attention logits (before softmax & already processed by casual mask), run page rank algorithm to compute importance scores.
-    """
-    import pdb; pdb.set_trace()
-    attn = attention_score.to(torch.float32) # attention_score.clone().detach().to(torch.float32)
-    B,H,N,_ = attn.shape  
-    M = attn
-
-    # page rank
-    dist = torch.ones(B,H,1,N).to(M.device, M.dtype) / N # average over received attention logits
-    dist = dist @ M
-    
-    # square to magnify importance
-    dist = torch.mean(dist.pow(2),dim=1).pow(0.5) # torch.mean(dist,dim=1) # 
-
-    # return score
-    importance = dist.view(B, N) 
-    return importance
-
-def gumbel_softmax(logits, k=1, tau=0.1, hard=False, eps=1e-10, dim=-1, gumbel_noises=None):
-    """Sample from the Gumbel-Softmax distribution (https://arxiv.org/abs/1611.00712, https://arxiv.org/abs/1611.01144) and optionally discretize.
-    logits: `[..., num_features]` unnormalized log probabilities
-    tau: non-negative scalar temperature
-    hard: if ``True``, the returned samples will be discretized as one-hot vectors, but will be differentiated as if it is the soft sample in autograd
-    dim (int): A dimension along which softmax will be computed. Default: -1.
-
-    Returns:
-      If ``hard=True``, the returned samples will be multi-/one-hot, otherwise they will be probability distributions from softmax.
-    """
-    if gumbel_noises is None:
-        gumbel_noises = gen_gumbel_noise(logits.size(), device=logits.device, eps=eps)
-    logits = logits * 1e4
-    noisy = (logits + gumbel_noises) / tau # logits / tau # 
-    y_soft = F.softmax(noisy, dim)
-
-    if hard: # straight-through: hard in forward, soft in backward
-        topk_vals, topk_idx = torch.topk(noisy, k, dim=-1) # get top-k indices
-        y_hard = torch.zeros_like(logits).scatter_(1, topk_idx, 1.0) # multi-hot target, hard 0/1
-        return (y_hard - y_soft).detach() + y_soft, gumbel_noises
-    else: # continuous weights using softmax instead of hard 0/1
-        return y_soft, gumbel_noises
-
-def gumbel_sigmoid(logits, k=1, tau=1.0, hard=False, eps=1e-10, dim=-1, gumbel_noises=None):
-    """ Sigmoid version: binary logits
-    """
-    if gumbel_noises is None:
-        gumbel_noises = gen_gumbel_noise(logits.size(), device=logits.device, eps=eps)
-    noisy = (logits + gumbel_noises) / tau # logits / tau # 
-
-    # compute differentiable threshold (approximate top-k cutoff)
-    if k != 0:
-        topk_vals, topk_idx = torch.topk(noisy, k, dim=-1)
-        threshold = topk_vals[:, -1].unsqueeze(-1)
-    else: # if no tokens should be selected, make dummy variables
-        _, topk_idx = torch.topk(noisy, 0, dim=-1) # empty indices
-        if noisy.size(1) != 0:
-            topk_vals, _ = torch.topk(noisy, 1, dim=-1) # maximum value
-            threshold = topk_vals[:, -1].unsqueeze(-1) + 1e-3
-        else: # corner case: the visual tokens are already empty before current layer
-            threshold = 0
-    y_soft = torch.sigmoid((noisy - threshold) / tau)
-    
-    if hard: # straight-through: hard in forward, soft in backward
-        # topk_vals, topk_idx = torch.topk(noisy, k, dim=-1) # get top-k indices
-        y_hard = torch.zeros_like(logits).scatter_(1, topk_idx, 1.0) # multi-hot target, hard 0/1
-        # y_hard = (y_soft > 0.5).float()
-        return (y_hard - y_soft).detach() + y_soft, gumbel_noises
-    else: # continuous weights using softmax instead of hard 0/1
-        return y_soft, gumbel_noises
 
 def bipartite_soft_matching_merge(
     metric: torch.Tensor,
@@ -2952,115 +2785,3 @@ def bipartite_soft_matching_merge(
             return merged_feats, merged_token_idx
         else:
             return merged_feats
-
-####################################
-####################################
-####################################
-
-def bipartite_soft_matching(
-    metric: torch.Tensor,
-    r: int, 
-) -> Tuple[Callable, Callable]:
-    """
-    Modified from the implementation of papers: https://arxiv.org/abs/2210.09461 & https://arxiv.org/abs/2412.03248
-    Batch token merging with a balanced matching set (50%, 50%).
-
-    Input size is [batch, tokens, channels].
-    r indicates the number of tokens to remove (max 50% of tokens).
-    """
-    protected = 0
-    
-    # We can only reduce by a maximum of 50% tokens
-    t = metric.shape[1]
-    r = min(r, (t - protected) // 2)
-
-    if r <= 0:
-        return None
-
-    with torch.no_grad():
-        metric = metric / metric.norm(dim=-1, keepdim=True)
-        a, b = metric[..., ::2, :], metric[..., 1::2, :] # a: source, b: dst
-        scores = a @ b.transpose(-1, -2) # row: source, col: dst
-
-        node_max, node_idx = scores.max(dim=-1) # col index (dst nodes): for each node (row), find a best matched node (col)
-        edge_idx = node_max.argsort(dim=-1, descending=True)[..., None] # row index (source nodes): rank best-matched pairs
-        ################################# maintain relative order of unmerged tokens #################################
-        unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens, the source nodes that do not related to merging operation (low similarity part)
-        unm_idx, _ = unm_idx.sort(dim=-2, descending=False)
-        ################################# maintain relative order of unmerged tokens #################################
-        # unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens, the source nodes that do not related to merging operation (low similarity part)
-        src_idx = edge_idx[..., :r, :]  # Merged Tokens, the source nodes to be merged (high similarity part)
-        dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx) # the selected values in node_idx are the dst nodes during merging operation, the values can be duplicated
-
-    def merge(x: torch.Tensor, token_idx: torch.Tensor = None, mode="mean") -> torch.Tensor:
-        src, dst = x[..., ::2, :], x[..., 1::2, :]
-        n, t1, c = src.shape
-        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c)) # the source nodes that do not related to merging operation 
-        src = src.gather(dim=-2, index=src_idx.expand(n, r, c)) # the source nodes to be merged
-        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode) # add source nodes to the indices in dst_idx, and merge them to the nodes in dst via 'mode'
-        merged_feats = torch.cat((unm, dst), dim=1) # [the source nodes that do not relate to merging, the dst nodes that already merged with matched source nodes], first item was sorted 
-
-        if token_idx is not None:
-            src_token_idx, dst_token_idx = token_idx[..., ::2, :], token_idx[..., 1::2, :]
-            unm_token_idx = src_token_idx.gather(dim=-2, index=unm_idx.expand(n, t1 - r, 1))
-            merged_token_idx = torch.cat((unm_token_idx, dst_token_idx), dim=1)
-            return merged_feats, merged_token_idx
-        else:
-            return merged_feats
-
-    def unmerge(x: torch.Tensor) -> torch.Tensor:
-        unm_len = unm_idx.shape[1]
-        unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
-        n, _, c = unm.shape
-
-        src = dst.gather(dim=-2, index=dst_idx.expand(n, r, c))
-
-        out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
-
-        out[..., 1::2, :] = dst
-        out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
-        out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
-
-        return out
-
-    return merge, unmerge
-
-def tome_per_frame(x, prune_ratio, n_head=1):
-    ## Suppose each snippet spanning one frame
-    x = einops.rearrange(x, "t c h w -> t (h w) c")
-    num_snippet, num_tokens_per_snippet, c = x.shape
-    dim_head = c // n_head
-    tgt_num_tokens = math.ceil(num_tokens_per_snippet * (1-prune_ratio))
-    curr_num_tokens = num_tokens_per_snippet
-    num_iter = 0
-    token_idx = torch.arange(curr_num_tokens, device=x.device).reshape(1, -1, 1)
-    while num_iter == 0 or curr_num_tokens > tgt_num_tokens:
-        metric = x.reshape(num_snippet, curr_num_tokens, n_head, dim_head).mean(2) # [num_snippet, num_tokens_per_snippet, head_dim]
-        num_remove_tokens = curr_num_tokens - tgt_num_tokens
-        merge, _ = bipartite_soft_matching(metric, num_remove_tokens)
-        x, token_idx = merge(x, token_idx)
-        _, curr_num_tokens, _ = x.shape
-        num_iter += 1
-    x = x.reshape(-1, c)
-    token_idx_final = token_idx.reshape(-1)
-    return x, token_idx_final
-
-def tome_per_video(x, prune_ratio, n_head=1):
-    ## Suppose each snippet spanning whole video
-    x = einops.rearrange(x, "t c h w -> 1 (t h w) c")
-    num_snippet, num_tokens_per_snippet, c = x.shape
-    dim_head = c // n_head
-    tgt_num_tokens = math.ceil(num_tokens_per_snippet * (1-prune_ratio))
-    curr_num_tokens = num_tokens_per_snippet
-    num_iter = 0
-    token_idx = torch.arange(curr_num_tokens, device=x.device).reshape(1, -1, 1)
-    while num_iter == 0 or curr_num_tokens > tgt_num_tokens:
-        metric = x.reshape(num_snippet, curr_num_tokens, n_head, dim_head).mean(2) # [num_snippet, num_tokens_per_snippet, head_dim]
-        num_remove_tokens = curr_num_tokens - tgt_num_tokens
-        merge, _ = bipartite_soft_matching(metric, num_remove_tokens)
-        x, token_idx = merge(x, token_idx)
-        _, curr_num_tokens, _ = x.shape
-        num_iter += 1
-    x = x.reshape(-1, c)
-    token_idx_final = token_idx.reshape(-1)
-    return x, token_idx_final

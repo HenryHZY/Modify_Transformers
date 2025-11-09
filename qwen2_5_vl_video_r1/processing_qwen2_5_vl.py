@@ -215,7 +215,6 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
                     q_start_idx = v_start_idx + n_vis_tokens
                     end_idx_plus = q_start_idx.new_full(q_start_idx.shape, fill_value=input_ids_b[b:b+1].size(1))
                     boundaries = torch.cat((v_start_idx, q_start_idx, end_idx_plus), dim=1) # (1, 3), [visual token start idx, question token start idx, #tokens] (system promt - visual - question)
-                    # 考虑第一个值换成<x.y seconds>
                     
                     # visual variables
                     T = vis_grid_thw_b[0].item()
@@ -275,7 +274,7 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
                 adjusted_boundaries[b_i, 0] = all_updated_boundaries[b_i][0, 0] + pad_len # instruction token move right due to padding
                 adjusted_boundaries[b_i, 1] = all_updated_boundaries[b_i][0, 1] + pad_len # question tokens move right (padding)
                 adjusted_boundaries[b_i, 2] = all_updated_boundaries[b_i][0, 2] + pad_len # end+1 token move right (padding)
-            text_inputs['preprocess_boundaries'] = adjusted_boundaries
+            text_inputs['preprocess_boundaries'] = adjusted_boundaries # modeling_qwen2_5_vl.py 实际上并没有使用这个
         else:
             text_inputs['preprocess_boundaries'] = None
         ############# Token Merging Preparation #############
