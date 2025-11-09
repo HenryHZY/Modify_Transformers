@@ -30,7 +30,6 @@ from ...tokenization_utils_base import PreTokenizedInput, TextInput
 from ...utils import logging
 from ...video_utils import VideoInput
 
-
 logger = logging.get_logger(__name__)
 
 
@@ -236,6 +235,7 @@ class Qwen3VLProcessor(ProcessorMixin):
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
         return_mm_token_type_ids = output_kwargs["text_kwargs"].pop("return_mm_token_type_ids", None)
         text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
+        
         self._check_special_mm_tokens(text, text_inputs, modalities=["image", "video"])
 
         if return_mm_token_type_ids:
@@ -243,6 +243,115 @@ class Qwen3VLProcessor(ProcessorMixin):
             mm_token_type_ids = np.zeros_like(text_inputs["input_ids"])
             mm_token_type_ids[array_ids == self.image_token_id] = 1
             text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
+        
+        ############# Token Merging Preparation #############
+        import pdb; pdb.set_trace()
+
+        run_our_forward = True
+        if run_our_forward:
+            # variables to be updated
+            input_ids = np.array(text_inputs['input_ids'])  # (B, L) # List -> ndarray，记得最后改回list # TODO: add device = ?
+            attention_mask = np.array(text_inputs['attention_mask'])  # (B, L) # List -> ndarray，记得最后改回list # TODO: add device = ?
+            
+            # Note_zy: Simply use bs=1 for each gpu during training & inference
+            assert input_ids.shape[0] == 1, f"Batch size > 1 (bs={input_ids.shape[0]}) 暂不支持"
+            
+            image_token_id = self.image_token_id
+            video_token_id = self.video_token_id
+            vision_start_token_id = self.vision_start_token_id
+            vision_end_token_id = self.vision_end_token_id
+                                        
+            # original variables (per sample)
+            if 'image_grid_thw' in image_inputs:
+                vis_grid_thw_b = image_inputs['image_grid_thw'][0]
+                v_pos_mask = (input_ids == image_token_id)  # Note_zy: image -> 单个boundary
+            elif 'video_grid_thw' in videos_inputs:
+                vis_grid_thw_b = videos_inputs['video_grid_thw'][0]
+                v_pos_mask = (input_ids == video_token_id)  # Note_zy: video -> 多个image -> 多个不连续的boundary
+            else:
+                vis_grid_thw_b = None
+                v_pos_mask = None
+
+            if v_pos_mask is not None and np.sum(v_pos_mask) > 0:                    
+                # visual variables
+                # checked: self.image_processor.merge_size = self.video_processor.merge_size = 2
+                T = int(vis_grid_thw_b[0])
+                H = int(vis_grid_thw_b[1]) // self.image_processor.merge_size  # self.config.vision_config.spatial_merge_size # see Qwen2_5_VLPatchMerger
+                W = int(vis_grid_thw_b[2]) // self.image_processor.merge_size  # self.config.vision_config.spatial_merge_size # see Qwen2_5_VLPatchMerger
+                token_cnt_uncompressed_per_frame = H * W  # e.g., (16*30)//4 = 120 for each frame
+                token_cnt = token_cnt_uncompressed_per_frame
+                token_cnt = token_cnt - token_cnt // 2  # 50%, e.g., 120 -> 60
+                token_cnt = token_cnt - token_cnt // 2  # 25%, e.g., 60 -> 30
+                reduct_cnt_per_frame = int(token_cnt_uncompressed_per_frame - token_cnt)  # e.g., 每帧删除120-30=90个token
+                reduct_cnt_total = reduct_cnt_per_frame * T  # e.g., 90*T
+                
+                input_ids_1d = input_ids[0]  # (L,)
+                attention_mask_1d = attention_mask[0]  # (L,)
+                
+                # system prompt + <t> + <|vision_start|> ..<|video_pad|>.. <|vision_end|> + ... + <t> + <|vision_start|> ..<|video_pad|>.. <|vision_end|> + question
+                    # example: '<|im_start|>user\n<19.6 seconds><|vision_start|>..120个<|video_pad|>..<|vision_end|><98.0 seconds><|vision_start|>..120个<|video_pad|>..<|vision_end|><176.3 seconds><|vision_start|>..120个<|video_pad|>..<|vision_end|><254.7 seconds><|vision_start|>..120个<|video_pad|>..<|vision_end|><333.1 seconds><|vision_start|>..120个<|video_pad|>..<|vision_end|><411.5 seconds><|vision_start|>..120个<|video_pad|>..<|vision_end|><489.9 seconds><|vision_start|>..120个<|video_pad|>..<|vision_end|><568.2 seconds><|vision_start|>..120个<|video_pad|>..<|vision_end|>Describe this video.<|im_end|>\n<|im_start|>assistant\n'
+                
+                # Note_zy: original boundary definition
+                # 找到所有的 [<|vision_start|>index, <|vision_end|>index] 的pairs，标注每一帧的起点与终点
+                vision_start_token_idx = np.where(input_ids_1d == vision_start_token_id)[0].tolist()  # list of idx
+                vision_end_token_idx = np.where(input_ids_1d == vision_end_token_id)[0].tolist()  # list of idx
+                vision_start_end_idx_pairs = list(zip(vision_start_token_idx, vision_end_token_idx))  # list of (start_idx, end_idx)
+                assert len(vision_start_end_idx_pairs) == T, f"找到的 <|vision_start|>/<|vision_end|> pairs 数量 ({len(vision_start_end_idx_pairs)}) 与 T ({T}) 不匹配"
+                # 找到最后一个 <|vision_end|> 为 question token start idx
+                q_start_idx = max(vision_end_token_idx)
+                # 修改boundary为 [[多对 [<|vision_start|>index, <|vision_end|>index]], #tokens]
+                num_tokens = input_ids.shape[0]
+                boundaries = [vision_start_end_idx_pairs, q_start_idx, num_tokens]
+                
+                # 进行token merging时，对于每一帧：<t> + <|vision_start|> ..<|video_pad|>.. <|vision_end|>
+                # 仅有<|video_pad|>进行merging，其余保持
+                updated_input_ids_chunks = []
+                updated_attention_mask_chunks = []
+                last_idx = 0
+
+                for (start_idx, end_idx) in vision_start_end_idx_pairs:
+                    # 添加此 video chunk 之前的 文本部分 (e.g., <|im_start|>user\n<19.6 seconds>)
+                    updated_input_ids_chunks.append(input_ids_1d[last_idx:start_idx])
+                    updated_attention_mask_chunks.append(attention_mask_1d[last_idx:start_idx])
+                    
+                    # 获取当前 video chunk 的 tokens
+                    chunk_start_token = input_ids_1d[start_idx : start_idx + 1]  # <|vision_start|>不进行token compression
+                    chunk_pad_tokens = input_ids_1d[start_idx + 1 : end_idx]     # e.g., 120 个 <|video_pad|>进行token compression
+                    chunk_end_token = input_ids_1d[end_idx : end_idx + 1]       # <|vision_end|>不进行token compression
+                    mask_start_token = attention_mask_1d[start_idx : start_idx + 1]
+                    mask_pad_tokens = attention_mask_1d[start_idx + 1 : end_idx]
+                    mask_end_token = attention_mask_1d[end_idx : end_idx + 1]
+                    
+                    # 检查 token 数量是否正确
+                    assert chunk_pad_tokens.shape[0] == token_cnt_uncompressed_per_frame, \
+                        f"Chunk {len(updated_input_ids_chunks)} 期望 {token_cnt_uncompressed_per_frame} 个 token, 但找到了 {chunk_pad_tokens.shape[0]} 个"
+
+                    # 压缩 <|video_pad|>
+                    compressed_pad_tokens = chunk_pad_tokens[reduct_cnt_per_frame:]  # e.g., 120 个 <|video_pad|> -> 30 个 <|video_pad|>
+                    compressed_mask_tokens = mask_pad_tokens[reduct_cnt_per_frame:]
+
+                    # 拼接压缩后的 video chunk
+                    updated_input_ids_chunks.append(np.concatenate((chunk_start_token, compressed_pad_tokens, chunk_end_token)))
+                    updated_attention_mask_chunks.append(np.concatenate((mask_start_token, compressed_mask_tokens, mask_end_token)))
+                    
+                    # 更新下一个文本块的起始索引
+                    last_idx = end_idx + 1
+
+                # 添加最后一个 video chunk 之后的 文本部分 (e.g., Describe this video.<|im_end|>\n<|im_start|>assistant\n)
+                updated_input_ids_chunks.append(input_ids_1d[last_idx:])
+                updated_attention_mask_chunks.append(attention_mask_1d[last_idx:])
+                
+                # 将所有压缩后的块重新组合，并添加 batch 维度
+                updated_input_ids = np.concatenate(updated_input_ids_chunks)[None, :]  # unsqueeze(0)
+                updated_attention_mask = np.concatenate(updated_attention_mask_chunks)[None, :]
+
+                # 更新 text_inputs (转回 list)
+                text_inputs['input_ids'] = updated_input_ids.tolist()
+                text_inputs['attention_mask'] = updated_attention_mask.tolist()
+                
+                # Not used
+                text_inputs['preprocess_boundaries'] = None
+        ############# Token Merging Preparation #############
 
         return BatchFeature(data={**text_inputs, **image_inputs, **videos_inputs}, tensor_type=return_tensors)
 
