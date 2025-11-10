@@ -245,13 +245,13 @@ class Qwen3VLProcessor(ProcessorMixin):
             text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
         
         ############# Token Merging Preparation #############
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
 
         run_our_forward = True
         if run_our_forward:
             # variables to be updated
-            input_ids = np.array(text_inputs['input_ids'])  # (B, L) # List -> ndarray，记得最后改回list # TODO: add device = ?
-            attention_mask = np.array(text_inputs['attention_mask'])  # (B, L) # List -> ndarray，记得最后改回list # TODO: add device = ?
+            input_ids = np.array(text_inputs['input_ids'])  # (B, L) # List -> ndarray，记得最后改回list
+            attention_mask = np.array(text_inputs['attention_mask'])  # (B, L) # List -> ndarray，记得最后改回list
             
             # Note_zy: Simply use bs=1 for each gpu during training & inference
             assert input_ids.shape[0] == 1, f"Batch size > 1 (bs={input_ids.shape[0]}) 暂不支持"
@@ -297,10 +297,10 @@ class Qwen3VLProcessor(ProcessorMixin):
                 vision_end_token_idx = np.where(input_ids_1d == vision_end_token_id)[0].tolist()  # list of idx
                 vision_start_end_idx_pairs = list(zip(vision_start_token_idx, vision_end_token_idx))  # list of (start_idx, end_idx)
                 assert len(vision_start_end_idx_pairs) == T, f"找到的 <|vision_start|>/<|vision_end|> pairs 数量 ({len(vision_start_end_idx_pairs)}) 与 T ({T}) 不匹配"
-                # 找到最后一个 <|vision_end|> 为 question token start idx
-                q_start_idx = max(vision_end_token_idx)
-                # 修改boundary为 [[多对 [<|vision_start|>index, <|vision_end|>index]], #tokens]
-                num_tokens = input_ids.shape[0]
+                # 找到最后一个 <|vision_end|> +1 为 question token start idx （末尾的、不包括<|vision_end|>的非视觉token的起点）
+                q_start_idx = max(vision_end_token_idx) + 1
+                # 修改boundary为 [[多对 [<|vision_start|>index, <|vision_end|>index]], q_start_idx, #tokens]
+                num_tokens = input_ids.shape[1]
                 boundaries = [vision_start_end_idx_pairs, q_start_idx, num_tokens]
                 
                 # 进行token merging时，对于每一帧：<t> + <|vision_start|> ..<|video_pad|>.. <|vision_end|>
@@ -350,7 +350,7 @@ class Qwen3VLProcessor(ProcessorMixin):
                 text_inputs['attention_mask'] = updated_attention_mask.tolist()
                 
                 # Not used
-                text_inputs['preprocess_boundaries'] = None
+                # text_inputs['preprocess_boundaries'] = None
         ############# Token Merging Preparation #############
 
         return BatchFeature(data={**text_inputs, **image_inputs, **videos_inputs}, tensor_type=return_tensors)

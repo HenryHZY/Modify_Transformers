@@ -184,22 +184,21 @@ def eager_attention_forward_with_pruning(
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
+    ############# token pruning #############
+    q_len = query.shape[-2] # check if query shape is (bs, num_heads, q_len, head_dim)
     importance_score = None
-    # ############# token pruning #############
-    # q_len = query.shape[-2] # check if query shape is (bs, num_heads, q_len, head_dim)
-    # importance_score = None
-    # is_prefill = past_key_values is None or past_key_values.get_seq_length() == 0
-    # flag = attention_mask.shape[-2] == attention_mask.shape[-1] # during standard prefill, attention_mask has shape (B, H, N, N)
-    # if q_len != 1 and flag: # prefill phrase
-    #     importance_score = get_importance(attn_weights)
-    #     # importance_score = torch.rand((attn_weights.shape[0], attn_weights.shape[3]), dtype=attn_weights.dtype, device=attn_weights.device)
-    # else:
-    #     if is_prefill: # RL stage get_per_token_logps()
-    #         importance_score = get_importance(attn_weights)
-    #         # importance_score = torch.rand((attn_weights.shape[0], attn_weights.shape[3]), dtype=attn_weights.dtype, device=attn_weights.device)
-    #     else: # decoding phrase
-    #         importance_score = 'decoding'
-    # ############# token pruning #############
+    is_prefill = past_key_values is None or past_key_values.get_seq_length() == 0
+    flag = attention_mask.shape[-2] == attention_mask.shape[-1] # during standard prefill, attention_mask has shape (B, H, N, N)
+    if q_len != 1 and flag: # prefill phrase
+        importance_score = get_importance(attn_weights)
+        # importance_score = torch.rand((attn_weights.shape[0], attn_weights.shape[3]), dtype=attn_weights.dtype, device=attn_weights.device)
+    else:
+        if is_prefill: # RL stage get_per_token_logps()
+            importance_score = get_importance(attn_weights)
+            # importance_score = torch.rand((attn_weights.shape[0], attn_weights.shape[3]), dtype=attn_weights.dtype, device=attn_weights.device)
+        else: # decoding phrase
+            importance_score = 'decoding'
+    ############# token pruning #############
 
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
@@ -843,51 +842,51 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
+        # self.layers = nn.ModuleList(
+        #     [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        # )
         
-        # ############# token pruning #############
-        # self.run_our_forward = True
-        # self.learnable_prune = False
-        # self.only_edit_mask = False
-        # if not self.run_our_forward:
-        #     self.layers = nn.ModuleList(
-        #         [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        #     )
-        # else:
-        #     # scheduler that can be customized
-        #     start_l = int(config.num_hidden_layers // 2)
-        #     self.retain_rate = [max(0, 1.0 - (layer_i - start_l + 1) * 0.2) if layer_i >= start_l else 1.0 for layer_i in range(config.num_hidden_layers)]
-        #     # self.retain_rate = [max(0, 1.0 - (layer_i - 14 + 1) * 0.2) if layer_i >= 14 else 1.0 for layer_i in range(config.num_hidden_layers)] 
-        #     # self.retain_rate = [max(0, 1.0 - (layer_i - 18 + 1) * 0.2) if layer_i >= 18 else 1.0 for layer_i in range(config.num_hidden_layers)] 
-        #     # self.retain_rate = [max(0, 1.0 - (layer_i - 18 + 1) * 0.1) if layer_i >= 18 else 1.0 for layer_i in range(config.num_hidden_layers)] 
-        #     # self.retain_rate = [max(0, 1.0 - (layer_i - 14 + 1) * 0.1) if layer_i >= 14 else 1.0 for layer_i in range(config.num_hidden_layers)] 
-        #     # self.retain_rate = [max(0, 1.0 - (layer_i - 9 + 1) * 0.1) if layer_i >= 9 else 1.0 for layer_i in range(config.num_hidden_layers)] 
-        #     # self.retain_rate = [max(0, 1.0 - (layer_i - 0 + 1) * 0.1) if layer_i >= 0 else 1.0 for layer_i in range(config.num_hidden_layers)] 
-        #     self.layers = nn.ModuleList()
-        #     # initialize the layers that perform token pruning to be eager mode
-        #     full_ratio = 1.0
-        #     for layer_idx in range(config.num_hidden_layers): # NOTE-ZY: qwen2.5vl7b的num_hidden_layers=28，qwen3vl的num_hidden_layers=36
-        #         if layer_idx == 0: # the first layer
-        #             if self.retain_rate[0] == full_ratio:
-        #                 self.layers.append(Qwen3VLTextDecoderLayer(config, layer_idx))
-        #             else:
-        #                 print(f"Do pruning: layer {layer_idx}")
-        #                 self.layers.append(Qwen3VLTextDecoderLayer(config, layer_idx, do_pruning=True))
-        #         else: # other layers
-        #             if (self.retain_rate[layer_idx] - self.retain_rate[layer_idx - 1]) == 0:
-        #                 self.layers.append(Qwen3VLTextDecoderLayer(config, layer_idx))
-        #             else:
-        #                 print(f"Do pruning: layer {layer_idx}")
-        #                 self.layers.append(Qwen3VLTextDecoderLayer(config, layer_idx, do_pruning=True))
+        ############# token pruning #############
+        self.run_our_forward = True
+        self.learnable_prune = False
+        self.only_edit_mask = False
+        if not self.run_our_forward:
+            self.layers = nn.ModuleList(
+                [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            )
+        else:
+            # scheduler that can be customized
+            start_l = int(config.num_hidden_layers // 2)
+            self.retain_rate = [max(0, 1.0 - (layer_i - start_l + 1) * 0.2) if layer_i >= start_l else 1.0 for layer_i in range(config.num_hidden_layers)]
+            # self.retain_rate = [max(0, 1.0 - (layer_i - 14 + 1) * 0.2) if layer_i >= 14 else 1.0 for layer_i in range(config.num_hidden_layers)] 
+            # self.retain_rate = [max(0, 1.0 - (layer_i - 18 + 1) * 0.2) if layer_i >= 18 else 1.0 for layer_i in range(config.num_hidden_layers)] 
+            # self.retain_rate = [max(0, 1.0 - (layer_i - 18 + 1) * 0.1) if layer_i >= 18 else 1.0 for layer_i in range(config.num_hidden_layers)] 
+            # self.retain_rate = [max(0, 1.0 - (layer_i - 14 + 1) * 0.1) if layer_i >= 14 else 1.0 for layer_i in range(config.num_hidden_layers)] 
+            # self.retain_rate = [max(0, 1.0 - (layer_i - 9 + 1) * 0.1) if layer_i >= 9 else 1.0 for layer_i in range(config.num_hidden_layers)] 
+            # self.retain_rate = [max(0, 1.0 - (layer_i - 0 + 1) * 0.1) if layer_i >= 0 else 1.0 for layer_i in range(config.num_hidden_layers)] 
+            self.layers = nn.ModuleList()
+            # initialize the layers that perform token pruning to be eager mode
+            full_ratio = 1.0
+            for layer_idx in range(config.num_hidden_layers): # NOTE-ZY: qwen2.5vl7b的num_hidden_layers=28，qwen3vl的num_hidden_layers=36
+                if layer_idx == 0: # the first layer
+                    if self.retain_rate[0] == full_ratio:
+                        self.layers.append(Qwen3VLTextDecoderLayer(config, layer_idx))
+                    else:
+                        print(f"Do pruning: layer {layer_idx}")
+                        self.layers.append(Qwen3VLTextDecoderLayer(config, layer_idx, do_pruning=True))
+                else: # other layers
+                    if (self.retain_rate[layer_idx] - self.retain_rate[layer_idx - 1]) == 0:
+                        self.layers.append(Qwen3VLTextDecoderLayer(config, layer_idx))
+                    else:
+                        print(f"Do pruning: layer {layer_idx}")
+                        self.layers.append(Qwen3VLTextDecoderLayer(config, layer_idx, do_pruning=True))
 
-        #     # Do pruning: layer 18
-        #     # Do pruning: layer 19
-        #     # Do pruning: layer 20
-        #     # Do pruning: layer 21
-        #     # Do pruning: layer 22
-        # ############# token pruning #############
+            # Do pruning: layer 18
+            # Do pruning: layer 19
+            # Do pruning: layer 20
+            # Do pruning: layer 21
+            # Do pruning: layer 22
+        ############# token pruning #############
         
         self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
@@ -940,7 +939,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
-        # import pdb; pdb.set_trace()
+        import pdb; pdb.set_trace()
         # the hard coded `3` is for temporal, height and width.
         if position_ids is None:
             position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
@@ -979,43 +978,43 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # ############# Token Merging with Pre-computed Input IDs #############
-        # is_prefill = past_key_values is None or past_key_values.get_seq_length() == 0 # denote prefill stage
-        # rl_forward = is_prefill and attention_mask is None # denote rl_forward get per token prob
-        # if is_prefill:
-        #     if vis_grid_thw is None: # this case doesn't exist, should be removed
-        #         pass
-        #     else: # prefilling stage or RL stage get_per_token_logps()
-        #         pass
-        # else: # decoding stage
-        #     pass
-        # ############# Token Merging with Pre-computed Input IDs #############
+        ############# Token Merging with Pre-computed Input IDs #############
+        is_prefill = past_key_values is None or past_key_values.get_seq_length() == 0 # denote prefill stage
+        rl_forward = is_prefill and attention_mask is None # denote rl_forward get per token prob
+        if is_prefill:
+            if vis_grid_thw is None: # this case doesn't exist, should be removed
+                pass
+            else: # prefilling stage or RL stage get_per_token_logps()
+                pass
+        else: # decoding stage
+            pass
+        ############# Token Merging with Pre-computed Input IDs #############
         
         
-        # ############# token pruning #############
-        # learnable_prune = self.learnable_prune
-        # run_our_forward = self.run_our_forward # boundaries is not None
-        # only_edit_mask = self.only_edit_mask 
-        # layer_idx = 0
-        # # initialize key vairables across layers
-        # if is_prefill: # prefill phrase
-        #     if run_our_forward:
-        #         self.attention_mask_cache = [None for _ in range(len(self.layers) + 1)]
-        #         self.attention_mask_cache[0] = attention_mask
-        #         self.position_ids_cache = [None for _ in range(len(self.layers) + 1)]
-        #         self.position_ids_cache[0] = position_ids
-        #         self.cache_position_cache = [None for _ in range(len(self.layers) + 1)]
-        #         self.cache_position_cache[0] = cache_position
-        #         self.boundaries_cache = [None for _ in range(len(self.layers) + 1)]
-        #         self.boundaries_cache[0] = boundaries
+        ############# token pruning #############
+        learnable_prune = self.learnable_prune
+        run_our_forward = self.run_our_forward # boundaries is not None
+        only_edit_mask = self.only_edit_mask 
+        layer_idx = 0
+        # initialize key vairables across layers
+        if is_prefill: # prefill phrase
+            if run_our_forward:
+                self.attention_mask_cache = [None for _ in range(len(self.layers) + 1)]
+                self.attention_mask_cache[0] = attention_mask
+                self.position_ids_cache = [None for _ in range(len(self.layers) + 1)]
+                self.position_ids_cache[0] = position_ids
+                self.cache_position_cache = [None for _ in range(len(self.layers) + 1)]
+                self.cache_position_cache[0] = cache_position
+                self.boundaries_cache = [None for _ in range(len(self.layers) + 1)]
+                self.boundaries_cache[0] = boundaries
                 
-        #         # protected_inds: all indices in a batch; protected_num: number of tokens per sample in a batch
-        #         # hidden_states.shape = torch.Size([1, 330, 4096])
-        #         protected_inds, protected_num = get_protected_info(boundaries, hidden_states) # TODO: 作用？boundary定义改变，是否需要调整？used in prefill stage, not used in decoing stage
-        #         v_cnt_before_llm = hidden_states.size(1) - protected_num
-        # else: # decoding phrase
-        #     running_rope_deltas = rope_deltas.clone() # avoid in-place edits
-        # ############# token pruning #############
+                # protected_inds: all indices in a batch; protected_num: number of tokens per sample in a batch
+                # hidden_states.shape = torch.Size([1, 330, 4096])
+                protected_inds, protected_num = get_protected_info(boundaries, hidden_states) # TODO: 作用？boundary定义改变，是否需要调整？used in prefill stage, not used in decoing stage
+                v_cnt_before_llm = hidden_states.size(1) - protected_num
+        else: # decoding phrase
+            running_rope_deltas = rope_deltas.clone() # avoid in-place edits
+        ############# token pruning #############
 
         # TODO: pass causal_mask
         # attention_mask = causal_mask
@@ -1052,194 +1051,194 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                     deepstack_visual_embeds[layer_idx],
                 )
 
-            # ############# token pruning #############
-            # importance_score = layer_outputs[-1] 
-            # if run_our_forward: # 开始选token, key tokens, score = attn_w，具体计算有现成func 
-            #     # generate, 第一次forward prefill，第二次forward decode 
-            #     # prefill: condition input -> kvcache 
-            #     # decode第一个 len(input)=1
-            #     # decode: kvcache + cur -> next pred
-            #     # will update kvcache -> attn.shape add 1, also for cache_pos
-            #     # batch操作：每层先要减k个token -> 最后再+1 (next pred) -> batch padding (由于每行数量不定，但是实际上一般都是bs=1，不过code有支持bs>1)
+            ############# token pruning #############
+            importance_score = layer_outputs[-1] 
+            if run_our_forward: # 开始选token, key tokens, score = attn_w，具体计算有现成func 
+                # generate, 第一次forward prefill，第二次forward decode 
+                # prefill: condition input -> kvcache 
+                # decode第一个 len(input)=1
+                # decode: kvcache + cur -> next pred
+                # will update kvcache -> attn.shape add 1, also for cache_pos
+                # batch操作：每层先要减k个token -> 最后再+1 (next pred) -> batch padding (由于每行数量不定，但是实际上一般都是bs=1，不过code有支持bs>1)
                 
-            #     # 对于强化学习，generate也是prefill + decode，
-            #     # 然后get per log at prefill stage
-            #     if importance_score is None: # no importance_score (flash attn layer) # 只有部分layer做pruning，初始化会定义好需要pruning的layer # 这个用flash attn
-            #         if not only_edit_mask: # 有些是flash attn，有些是eager attn，为了对齐，输入输出不太一样【如果是纯eager，会OOM】
-            #             if is_prefill: # prefill phrase or RL stage get_per_token_logps()
-            #                 self.attention_mask_cache[layer_idx + 1] = attention_mask
-            #                 self.position_ids_cache[layer_idx + 1] = position_ids
-            #                 self.boundaries_cache[layer_idx + 1] = boundaries
-            #                 self.cache_position_cache[layer_idx + 1] = cache_position
+                # 对于强化学习，generate也是prefill + decode，
+                # 然后get per log at prefill stage
+                if importance_score is None: # no importance_score (flash attn layer) # 只有部分layer做pruning，初始化会定义好需要pruning的layer # 这个用flash attn
+                    if not only_edit_mask: # 有些是flash attn，有些是eager attn，为了对齐，输入输出不太一样【如果是纯eager，会OOM】
+                        if is_prefill: # prefill phrase or RL stage get_per_token_logps()
+                            self.attention_mask_cache[layer_idx + 1] = attention_mask
+                            self.position_ids_cache[layer_idx + 1] = position_ids
+                            self.boundaries_cache[layer_idx + 1] = boundaries
+                            self.cache_position_cache[layer_idx + 1] = cache_position
                             
-            #                 if (layer_idx + 1) < len(self.layers):
-            #                     if self.layers[layer_idx + 1].self_attn_type == 'eager': # layer transition: recompute mask for next layer (eager type)
-            #                         causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_prefill=True)
-            #                     else: # continue to be flash attn layer type
-            #                         pass # causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
-            #             else: # decoding phrase (append new token)
-            #                 # get variables of next layer from prefill cache
-            #                 attention_mask = self.attention_mask_cache[layer_idx + 1] 
-            #                 position_ids = self.position_ids_cache[layer_idx + 1] 
-            #                 cache_position = self.cache_position_cache[layer_idx + 1] 
-            #                 boundaries = self.boundaries_cache[layer_idx + 1]
+                            if (layer_idx + 1) < len(self.layers):
+                                if self.layers[layer_idx + 1].self_attn_type == 'eager': # layer transition: recompute mask for next layer (eager type)
+                                    causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_prefill=True)
+                                else: # continue to be flash attn layer type
+                                    pass # causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
+                        else: # decoding phrase (append new token)
+                            # get variables of next layer from prefill cache
+                            attention_mask = self.attention_mask_cache[layer_idx + 1] 
+                            position_ids = self.position_ids_cache[layer_idx + 1] 
+                            cache_position = self.cache_position_cache[layer_idx + 1] 
+                            boundaries = self.boundaries_cache[layer_idx + 1]
 
-            #                 # convert variables to decoding stage (usually one input token)
-            #                 batch_size, seq_length, _ = hidden_states.shape
-            #                 attention_mask = torch.cat((attention_mask, attention_mask.new_full((attention_mask.shape[0], seq_length), fill_value=1)), dim=-1) # append mask for the input token
-            #                 cache_position = torch.arange(seq_length, device=cache_position.device) + cache_position[-1].item() + 1 # cache position for input token
-            #                 # NOTE: cache_position value would decrease as layer goes deeper, yet position_ids should keep increasing as if there was no token compression
-            #                 reduct_cnt = (self.boundaries_cache[layer_idx] - self.boundaries_cache[layer_idx + 1])[:, 1:2]
-            #                 running_rope_deltas += reduct_cnt
-            #                 delta = ((cache_position[0] + running_rope_deltas).to(hidden_states.device) if cache_position is not None else 0)
-            #                 position_ids = torch.arange(seq_length, device=hidden_states.device)
-            #                 position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-            #                 if cache_position is not None:  # otherwise `deltas` is an int `0`
-            #                     delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
-            #                 position_ids = position_ids.add(delta)
-            #                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+                            # convert variables to decoding stage (usually one input token)
+                            batch_size, seq_length, _ = hidden_states.shape
+                            attention_mask = torch.cat((attention_mask, attention_mask.new_full((attention_mask.shape[0], seq_length), fill_value=1)), dim=-1) # append mask for the input token
+                            cache_position = torch.arange(seq_length, device=cache_position.device) + cache_position[-1].item() + 1 # cache position for input token
+                            # NOTE: cache_position value would decrease as layer goes deeper, yet position_ids should keep increasing as if there was no token compression
+                            reduct_cnt = (self.boundaries_cache[layer_idx] - self.boundaries_cache[layer_idx + 1])[:, 1:2]
+                            running_rope_deltas += reduct_cnt
+                            delta = ((cache_position[0] + running_rope_deltas).to(hidden_states.device) if cache_position is not None else 0)
+                            position_ids = torch.arange(seq_length, device=hidden_states.device)
+                            position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+                            if cache_position is not None:  # otherwise `deltas` is an int `0`
+                                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+                            position_ids = position_ids.add(delta)
+                            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-            #                 # re-compute for next layer
-            #                 if (layer_idx + 1) < len(self.layers):
-            #                     if self.layers[layer_idx + 1].self_attn_type == 'eager': # layer transition: recompute mask for next layer (eager type)
-            #                         causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
-            #                     else: # continue to be flash attn layer type
-            #                         pass # causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
-            #                 position_embeddings = self.rotary_emb(hidden_states, position_ids) # computed w.r.t. position_ids values, irrelevant to hidden_states values
+                            # re-compute for next layer
+                            if (layer_idx + 1) < len(self.layers):
+                                if self.layers[layer_idx + 1].self_attn_type == 'eager': # layer transition: recompute mask for next layer (eager type)
+                                    causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
+                                else: # continue to be flash attn layer type
+                                    pass # causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions)
+                            position_embeddings = self.rotary_emb(hidden_states, position_ids) # computed w.r.t. position_ids values, irrelevant to hidden_states values
 
-            #                 # update cache for next token input
-            #                 self.attention_mask_cache[layer_idx + 1] = attention_mask # [item.shape[1] for item in self.attention_mask_cache]
-            #                 self.cache_position_cache[layer_idx + 1] = cache_position # [item.shape[2] for item in self.position_ids_cache], self.position_ids_cache[0], self.position_ids_cache[-1] 
-            #                 self.position_ids_cache[layer_idx + 1] = position_ids # [item[-1] for item in self.cache_position_cache]
-            #                 self.boundaries_cache[layer_idx + 1][:, 2] += 1 # self.boundaries_cache, boundary at each layer keeps the same, except that the seq length + 1
-            #     else: # do pruning # 有pruning的需要用eager mode attn
-            #         import pdb; pdb.set_trace()
-            #         if importance_score == 'decoding': # decoding phrase
-            #             # append new token # 为了一个新token，并且真的丢掉
-            #             # get variables of next layer from prefill cache
-            #             attention_mask = self.attention_mask_cache[layer_idx + 1] 
-            #             position_ids = self.position_ids_cache[layer_idx + 1] 
-            #             cache_position = self.cache_position_cache[layer_idx + 1] 
-            #             boundaries = self.boundaries_cache[layer_idx + 1]
+                            # update cache for next token input
+                            self.attention_mask_cache[layer_idx + 1] = attention_mask # [item.shape[1] for item in self.attention_mask_cache]
+                            self.cache_position_cache[layer_idx + 1] = cache_position # [item.shape[2] for item in self.position_ids_cache], self.position_ids_cache[0], self.position_ids_cache[-1] 
+                            self.position_ids_cache[layer_idx + 1] = position_ids # [item[-1] for item in self.cache_position_cache]
+                            self.boundaries_cache[layer_idx + 1][:, 2] += 1 # self.boundaries_cache, boundary at each layer keeps the same, except that the seq length + 1
+                else: # do pruning # 有pruning的需要用eager mode attn
+                    import pdb; pdb.set_trace()
+                    if importance_score == 'decoding': # decoding phrase
+                        # append new token # 为了一个新token，并且真的丢掉
+                        # get variables of next layer from prefill cache
+                        attention_mask = self.attention_mask_cache[layer_idx + 1] 
+                        position_ids = self.position_ids_cache[layer_idx + 1] 
+                        cache_position = self.cache_position_cache[layer_idx + 1] 
+                        boundaries = self.boundaries_cache[layer_idx + 1]
 
-            #             # convert variables to decoding stage (usually one input token)
-            #             batch_size, seq_length, _ = hidden_states.shape
-            #             attention_mask = torch.cat((attention_mask, attention_mask.new_full((attention_mask.shape[0], seq_length), fill_value=1)), dim=-1) # append mask for the input token
-            #             cache_position = torch.arange(seq_length, device=cache_position.device) + cache_position[-1].item() + 1 # cache position for input token
-            #             # NOTE: cache_position value would decrease as layer goes deeper, yet position_ids should keep increasing as if there was no token compression
-            #             reduct_cnt = (self.boundaries_cache[layer_idx] - self.boundaries_cache[layer_idx + 1])[:, 1:2]
-            #             running_rope_deltas += reduct_cnt
-            #             delta = ((cache_position[0] + running_rope_deltas).to(hidden_states.device) if cache_position is not None else 0)
-            #             position_ids = torch.arange(seq_length, device=hidden_states.device)
-            #             position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-            #             if cache_position is not None:  # otherwise `deltas` is an int `0`
-            #                 delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
-            #             position_ids = position_ids.add(delta)
-            #             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+                        # convert variables to decoding stage (usually one input token)
+                        batch_size, seq_length, _ = hidden_states.shape
+                        attention_mask = torch.cat((attention_mask, attention_mask.new_full((attention_mask.shape[0], seq_length), fill_value=1)), dim=-1) # append mask for the input token
+                        cache_position = torch.arange(seq_length, device=cache_position.device) + cache_position[-1].item() + 1 # cache position for input token
+                        # NOTE: cache_position value would decrease as layer goes deeper, yet position_ids should keep increasing as if there was no token compression
+                        reduct_cnt = (self.boundaries_cache[layer_idx] - self.boundaries_cache[layer_idx + 1])[:, 1:2]
+                        running_rope_deltas += reduct_cnt
+                        delta = ((cache_position[0] + running_rope_deltas).to(hidden_states.device) if cache_position is not None else 0)
+                        position_ids = torch.arange(seq_length, device=hidden_states.device)
+                        position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+                        if cache_position is not None:  # otherwise `deltas` is an int `0`
+                            delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
+                        position_ids = position_ids.add(delta)
+                        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-            #             # re-compute for next layer
-            #             # causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
-            #             if (layer_idx + 1) < len(self.layers):
-            #                 if self.layers[layer_idx + 1].self_attn_type != 'eager': # layer transition: recompute mask for next layer (flash attn type)
-            #                     causal_mask = causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions)
-            #                 else: # continue to be eager layer type
-            #                     causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
-            #             position_embeddings = self.rotary_emb(hidden_states, position_ids) # computed w.r.t. position_ids values, irrelevant to hidden_states values
+                        # re-compute for next layer
+                        # causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
+                        if (layer_idx + 1) < len(self.layers):
+                            if self.layers[layer_idx + 1].self_attn_type != 'eager': # layer transition: recompute mask for next layer (flash attn type)
+                                causal_mask = causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions)
+                            else: # continue to be eager layer type
+                                causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
+                        position_embeddings = self.rotary_emb(hidden_states, position_ids) # computed w.r.t. position_ids values, irrelevant to hidden_states values
 
-            #             # update cache for next token input
-            #             self.attention_mask_cache[layer_idx + 1] = attention_mask # [item.shape[1] for item in self.attention_mask_cache]
-            #             self.cache_position_cache[layer_idx + 1] = cache_position # [item.shape[2] for item in self.position_ids_cache], self.position_ids_cache[0], self.position_ids_cache[-1] 
-            #             self.position_ids_cache[layer_idx + 1] = position_ids # [item[-1] for item in self.cache_position_cache]
-            #             self.boundaries_cache[layer_idx + 1][:, 2] += 1 # self.boundaries_cache, boundary at each layer keeps the same, except that the seq length + 1
-            #         else: # prefill phrase                             
-            #             # set random scores if nan appears so that no protected tokens are pruned
-            #             if torch.isnan(importance_score).any().item():
-            #                 print("Got nan in importance_score!")
-            #                 importance_score = torch.randn_like(importance_score).fill_(-1.0)
+                        # update cache for next token input
+                        self.attention_mask_cache[layer_idx + 1] = attention_mask # [item.shape[1] for item in self.attention_mask_cache]
+                        self.cache_position_cache[layer_idx + 1] = cache_position # [item.shape[2] for item in self.position_ids_cache], self.position_ids_cache[0], self.position_ids_cache[-1] 
+                        self.position_ids_cache[layer_idx + 1] = position_ids # [item[-1] for item in self.cache_position_cache]
+                        self.boundaries_cache[layer_idx + 1][:, 2] += 1 # self.boundaries_cache, boundary at each layer keeps the same, except that the seq length + 1
+                    else: # prefill phrase                             
+                        # set random scores if nan appears so that no protected tokens are pruned
+                        if torch.isnan(importance_score).any().item():
+                            print("Got nan in importance_score!")
+                            importance_score = torch.randn_like(importance_score).fill_(-1.0)
 
-            #             # keep the important tokens that are also valid current layer (#tokens are decreasing over layers)
-            #             chosen_hidden_states = []
-            #             chosen_attention_masks = []
-            #             chosen_position_ids = []
-            #             if not learnable_prune: # prune tokens based on importance score # learnable是false，old实现
-            #                 # set scores to 1.0 for text tokens that should be protected
-            #                 # TODO: 这里 v_cnt_before_llm 定义是输入的visual token总数
-            #                 keep_num = (v_cnt_before_llm * self.retain_rate[layer_idx]).long() + protected_num # (importance_score.shape[1] - protected_num) * self.retain_rate[layer_idx] + protected_num
-            #                 importance_score[protected_inds[:, 0], protected_inds[:, 1]] = 1.0 # importance_score: (B, N)
-            #                 _, inds = torch.sort(importance_score, dim=-1, descending=True)   
+                        # keep the important tokens that are also valid current layer (#tokens are decreasing over layers)
+                        chosen_hidden_states = []
+                        chosen_attention_masks = []
+                        chosen_position_ids = []
+                        if not learnable_prune: # prune tokens based on importance score # learnable是false，old实现
+                            # set scores to 1.0 for text tokens that should be protected
+                            # TODO: 这里 v_cnt_before_llm 定义是输入的visual token总数
+                            keep_num = (v_cnt_before_llm * self.retain_rate[layer_idx]).long() + protected_num # (importance_score.shape[1] - protected_num) * self.retain_rate[layer_idx] + protected_num
+                            importance_score[protected_inds[:, 0], protected_inds[:, 1]] = 1.0 # importance_score: (B, N)
+                            _, inds = torch.sort(importance_score, dim=-1, descending=True)   
 
-            #                 for b_i in range(hidden_states.size(0)):
-            #                     # the indices we kept
-            #                     keep_inds = inds[b_i:(b_i+1), :int(keep_num[b_i].item())].to(hidden_states.device) 
-            #                     keep_inds, _ = torch.sort(keep_inds, dim=-1)
+                            for b_i in range(hidden_states.size(0)):
+                                # the indices we kept
+                                keep_inds = inds[b_i:(b_i+1), :int(keep_num[b_i].item())].to(hidden_states.device) 
+                                keep_inds, _ = torch.sort(keep_inds, dim=-1)
 
-            #                     # keep the chosen token embeddings, attention masks, position ids
-            #                     hidden_states_b = torch.gather(hidden_states[b_i:(b_i+1)], dim=1, index=keep_inds.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))) # (1, N, C)
-            #                     attention_mask_b = torch.gather(attention_mask[b_i:(b_i+1)], dim=1, index=keep_inds) if attention_mask is not None else None # (1, N)
-            #                     position_ids_b = torch.gather(position_ids[:, b_i:(b_i+1), :], dim=2, index=keep_inds.unsqueeze(0).expand(position_ids.size(0), -1, -1)) # (3, 1, N)
-            #                     chosen_hidden_states.append(hidden_states_b)
-            #                     chosen_attention_masks.append(attention_mask_b)
-            #                     chosen_position_ids.append(position_ids_b)       
+                                # keep the chosen token embeddings, attention masks, position ids
+                                hidden_states_b = torch.gather(hidden_states[b_i:(b_i+1)], dim=1, index=keep_inds.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))) # (1, N, C)
+                                attention_mask_b = torch.gather(attention_mask[b_i:(b_i+1)], dim=1, index=keep_inds) if attention_mask is not None else None # (1, N)
+                                position_ids_b = torch.gather(position_ids[:, b_i:(b_i+1), :], dim=2, index=keep_inds.unsqueeze(0).expand(position_ids.size(0), -1, -1)) # (3, 1, N)
+                                chosen_hidden_states.append(hidden_states_b)
+                                chosen_attention_masks.append(attention_mask_b)
+                                chosen_position_ids.append(position_ids_b)       
 
-            #             # find max length among all samples in the batch
-            #             max_len = max(x.size(1) for x in chosen_hidden_states)
-            #             # left pad token embeddings
-            #             padded_hidden_states = []
-            #             for item in chosen_hidden_states: # (1, N, C)
-            #                 pad_len = max_len - item.size(1)
-            #                 padded = torch.cat([torch.full((1,pad_len,hidden_states.size(-1)), 0, dtype=item.dtype, device=item.device), item], dim=1) # left pad
-            #                 padded_hidden_states.append(padded)
-            #             padded_hidden_states = torch.cat(padded_hidden_states, dim=0)
-            #             # left pad attention masks
-            #             if attention_mask_b is not None:
-            #                 padded_attention_masks = []
-            #                 for item in chosen_attention_masks: # (1, N)
-            #                     pad_len = max_len - item.size(1)
-            #                     padded = torch.cat([torch.full((1,pad_len), 0, dtype=item.dtype, device=item.device), item], dim=1) # left pad
-            #                     padded_attention_masks.append(padded)
-            #                 padded_attention_masks = torch.cat(padded_attention_masks, dim=0)
-            #             else:
-            #                 padded_attention_masks = None
-            #             # left pad position ids
-            #             padded_position_ids = []
-            #             for item in chosen_position_ids: # (3, 1, N)
-            #                 pad_len = max_len - item.size(2)
-            #                 padded = torch.cat([torch.full((3,1,pad_len), 1, dtype=item.dtype, device=item.device), item], dim=2) # left pad 1 as default implementation
-            #                 padded_position_ids.append(padded)
-            #             padded_position_ids = torch.cat(padded_position_ids, dim=1)
+                        # find max length among all samples in the batch
+                        max_len = max(x.size(1) for x in chosen_hidden_states)
+                        # left pad token embeddings
+                        padded_hidden_states = []
+                        for item in chosen_hidden_states: # (1, N, C)
+                            pad_len = max_len - item.size(1)
+                            padded = torch.cat([torch.full((1,pad_len,hidden_states.size(-1)), 0, dtype=item.dtype, device=item.device), item], dim=1) # left pad
+                            padded_hidden_states.append(padded)
+                        padded_hidden_states = torch.cat(padded_hidden_states, dim=0)
+                        # left pad attention masks
+                        if attention_mask_b is not None:
+                            padded_attention_masks = []
+                            for item in chosen_attention_masks: # (1, N)
+                                pad_len = max_len - item.size(1)
+                                padded = torch.cat([torch.full((1,pad_len), 0, dtype=item.dtype, device=item.device), item], dim=1) # left pad
+                                padded_attention_masks.append(padded)
+                            padded_attention_masks = torch.cat(padded_attention_masks, dim=0)
+                        else:
+                            padded_attention_masks = None
+                        # left pad position ids
+                        padded_position_ids = []
+                        for item in chosen_position_ids: # (3, 1, N)
+                            pad_len = max_len - item.size(2)
+                            padded = torch.cat([torch.full((3,1,pad_len), 1, dtype=item.dtype, device=item.device), item], dim=2) # left pad 1 as default implementation
+                            padded_position_ids.append(padded)
+                        padded_position_ids = torch.cat(padded_position_ids, dim=1)
 
-            #             # adjust boundaries for next layer 
-            #             adjusted_boundaries = boundaries.new_full(boundaries.shape, fill_value=0)
-            #             for b_i, item in enumerate(chosen_hidden_states): # (1, N, C)
-            #                 pad_len = max_len - item.size(1)
-            #                 adjusted_boundaries[b_i, 0] = boundaries[b_i, 0] + pad_len # instruction token move right due to padding
-            #                 reduct_cnt = importance_score.shape[1] - chosen_hidden_states[b_i].shape[1]
-            #                 adjusted_boundaries[b_i, 1] = boundaries[b_i, 1] + pad_len - reduct_cnt # question tokens move right (padding) and then move left (visual compression)
-            #                 adjusted_boundaries[b_i, 2] = boundaries[b_i, 2] + pad_len - reduct_cnt # end+1 token move right (padding) and then move left (visual compression)
+                        # adjust boundaries for next layer 
+                        adjusted_boundaries = boundaries.new_full(boundaries.shape, fill_value=0)
+                        for b_i, item in enumerate(chosen_hidden_states): # (1, N, C)
+                            pad_len = max_len - item.size(1)
+                            adjusted_boundaries[b_i, 0] = boundaries[b_i, 0] + pad_len # instruction token move right due to padding
+                            reduct_cnt = importance_score.shape[1] - chosen_hidden_states[b_i].shape[1]
+                            adjusted_boundaries[b_i, 1] = boundaries[b_i, 1] + pad_len - reduct_cnt # question tokens move right (padding) and then move left (visual compression)
+                            adjusted_boundaries[b_i, 2] = boundaries[b_i, 2] + pad_len - reduct_cnt # end+1 token move right (padding) and then move left (visual compression)
                         
-            #             # outputs to next layer
-            #             hidden_states = padded_hidden_states
-            #             attention_mask = padded_attention_masks
-            #             self.attention_mask_cache[layer_idx + 1] = attention_mask
-            #             position_ids = padded_position_ids
-            #             self.position_ids_cache[layer_idx + 1] = position_ids
-            #             boundaries = adjusted_boundaries
-            #             self.boundaries_cache[layer_idx + 1] = boundaries
-            #             cache_position = cache_position[:max_len] # during prefill, cache_position variable keeps the same across layers (default), yet keeps changed when doing token compression
-            #             self.cache_position_cache[layer_idx + 1] = cache_position # we have #max_len tokens to process in next layer (cache is independently managed at each layer)
+                        # outputs to next layer
+                        hidden_states = padded_hidden_states
+                        attention_mask = padded_attention_masks
+                        self.attention_mask_cache[layer_idx + 1] = attention_mask
+                        position_ids = padded_position_ids
+                        self.position_ids_cache[layer_idx + 1] = position_ids
+                        boundaries = adjusted_boundaries
+                        self.boundaries_cache[layer_idx + 1] = boundaries
+                        cache_position = cache_position[:max_len] # during prefill, cache_position variable keeps the same across layers (default), yet keeps changed when doing token compression
+                        self.cache_position_cache[layer_idx + 1] = cache_position # we have #max_len tokens to process in next layer (cache is independently managed at each layer)
 
-            #             # re-compute critical variables for next layer
-            #             # causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_prefill=True)
-            #             if (layer_idx + 1) < len(self.layers):
-            #                 if self.layers[layer_idx + 1].self_attn_type != 'eager': # layer transition: recompute mask for next layer (flash attn type)
-            #                     causal_mask = causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions)
-            #                 else: # continue to be eager layer type
-            #                     causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_prefill=True)
-            #             position_embeddings = self.rotary_emb(hidden_states, position_ids) # computed w.r.t. position_ids values, irrelevant to hidden_states values
-            #             protected_inds, protected_num = get_protected_info(boundaries, hidden_states) 
+                        # re-compute critical variables for next layer
+                        # causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_prefill=True)
+                        if (layer_idx + 1) < len(self.layers):
+                            if self.layers[layer_idx + 1].self_attn_type != 'eager': # layer transition: recompute mask for next layer (flash attn type)
+                                causal_mask = causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions)
+                            else: # continue to be eager layer type
+                                causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_prefill=True)
+                        position_embeddings = self.rotary_emb(hidden_states, position_ids) # computed w.r.t. position_ids values, irrelevant to hidden_states values
+                        protected_inds, protected_num = get_protected_info(boundaries, hidden_states) 
 
-            #     layer_idx += 1
-            # ############# token pruning #############
+                layer_idx += 1
+            ############# token pruning #############
             
         hidden_states = self.norm(hidden_states)
 
@@ -1862,6 +1861,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 real_visual_pos_masks_for_first_three_layers = (input_ids == self.config.image_token_id) # 修改image
                 visual_pos_masks = real_visual_pos_masks_for_first_three_layers
                 deepstack_visual_embeds = [layer_embeds[token_idx] for layer_embeds in deepstack_image_embeds] # 修改image
+                pass
             
             if pixel_values_videos is not None:
                 # TODO: deepstack_visual_embeds筛选
@@ -2003,7 +2003,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                     if cache_position is not None
                     else 0
                 )
-                # import pdb; pdb.set_trace()
+                import pdb; pdb.set_trace()
                 position_ids = torch.arange(seq_length, device=inputs_embeds.device)
                 position_ids = position_ids.view(1, -1).expand(batch_size, -1)
                 if cache_position is not None:  # otherwise `deltas` is an int `0`
@@ -2178,7 +2178,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
-        updated_labels = None # for SFT
+        updated_labels = None
         if labels is not None:
             if outputs.run_our_forward: # 零散的辅助操作，比如modify data type
                 ##### NOTE: assume batch as 1 per device during training
@@ -2190,8 +2190,8 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
 
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 
-        updated_input_ids = None # for RL
-        updated_logits = None # for RL
+        updated_input_ids = None
+        updated_logits = None
         if outputs.run_our_forward:
             if self.training: # NOTE: Upcast to float if we need to compute the loss to avoid potential precision issues (e.g., nan gradients)
                 logits = logits.float()

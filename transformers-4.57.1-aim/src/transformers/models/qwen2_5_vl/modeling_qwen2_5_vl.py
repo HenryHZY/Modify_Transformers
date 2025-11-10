@@ -872,7 +872,7 @@ class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
                 "full_attention": create_causal_mask(**mask_kwargs),
             }
             # The sliding window alternating layers are not always activated depending on the config
-            if self.has_sliding_layers:
+            if self.has_sliding_layers: # Note_zy: Default as self.has_sliding_layers = False for qwen2.5vl7B
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds

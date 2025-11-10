@@ -2133,8 +2133,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                         # last_nonzero_idx_from_end = reversed_mask.float().argmax(dim=1)
                         # last_nonzero_idx = v_pos_mask.size(1) - last_nonzero_idx_from_end
                         # during RL stage get_per_token_logps(), the generated tokens might be visual tokens, which disturbs boundary computation here
-                        v_start_idx = first_nonzero_idx.view(1,-1)
-                        q_start_idx = v_start_idx + vis_embeds.size(1) # last_nonzero_idx.min().view(1,-1)
+                        v_start_idx = first_nonzero_idx.view(1,-1) 
+                        q_start_idx = v_start_idx + vis_embeds.size(1) # last_nonzero_idx.min().view(1,-1) 
                         end_idx_plus = q_start_idx.new_full(q_start_idx.shape, fill_value=input_ids[b:b+1].size(1))
                         # [visual token start idx, question token start idx, #tokens] (system promt - visual - question)
                         boundary_b = torch.cat((v_start_idx, q_start_idx, end_idx_plus), dim=1) # torch.cat((first_nonzero_idx.view(-1, 1), last_nonzero_idx.view(-1, 1)), dim=1) 
