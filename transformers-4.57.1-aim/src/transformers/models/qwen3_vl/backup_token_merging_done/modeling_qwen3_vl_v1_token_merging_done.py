@@ -1701,7 +1701,123 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 )
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
             else:
-                pass # TODO: 用video来debug, 图片代码后续参考video
+                # NOTE-ZY: image代码简答改自video
+                                # 用qwen3vl的操作替换qwen2.5vl-r1的操作
+                image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+                image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+                                
+                ############# Token Merging with Pre-computed Input IDs #############
+                # Token merging: keep unique tokens and their position info, without re-assignment
+                # NOTE-ZY: Simply use bs=1 for each gpu during training & inference
+                assert input_ids.shape[0] == 1, f"Batch size > 1 (bs={input_ids.shape[0]}) 暂不支持"
+                
+                # import pdb; pdb.set_trace()
+                vis_token_id = self.config.image_token_id
+                vision_start_token_id = self.config.vision_start_token_id
+                vision_end_token_id = self.config.vision_end_token_id
+                vis_grid_thw_b = image_grid_thw[0] # tensor([ 8, 16, 30], device='cuda:0')
+                
+                # perform spatial token merging within each frame
+                # checked: image_processor.merge_size = video_processor.merge_size = 2
+                T = vis_grid_thw_b[0].item() # e.g., 8
+                H = vis_grid_thw_b[1].item() // self.config.vision_config.spatial_merge_size # e.g., 8
+                W = vis_grid_thw_b[2].item() // self.config.vision_config.spatial_merge_size # e.g., 15
+                C = inputs_embeds.size(-1)
+                vis_feats = einops.rearrange(image_embeds, "(T H W) C -> T (H W) C", T=T, H=H) # encoder_vis_embeds_b[0] # torch.Size([8, 120, 4096])
+                token_idx = torch.arange(T * H * W, device=vis_feats.device).reshape(T, -1, 1) # (T, H, W) the index covers the whole image # torch.Size([8, 120, 1])
+                vis_feats, token_idx = bipartite_soft_matching_merge(metric=vis_feats, r=vis_feats.shape[1]//2, x=vis_feats, token_idx=token_idx) # 50% 
+                    # vis_feats.shape = torch.Size([8, 60, 4096]), token_idx.shape = torch.Size([8, 60, 1])
+                vis_feats, token_idx = bipartite_soft_matching_merge(metric=vis_feats, r=vis_feats.shape[1]//2, x=vis_feats, token_idx=token_idx) # 25% 
+                    # vis_feats.shape = torch.Size([8, 30, 4096]), token_idx.shape = torch.Size([8, 30, 1])
+                
+                # the visual embeddings and indices after merging
+                token_idx = token_idx.reshape(-1) # the indices within visual token scope # 记录被保留的token -> 为了后面算pos -> 恢复为原本的pos # torch.Size([240])
+
+                input_ids_1d = input_ids[0]  # shape = (L,)
+                if attention_mask is not None:
+                    attention_mask_1d = attention_mask[0]  # shape = (L,)
+                else:
+                    attention_mask_1d = None # Handle case where attention_mask is None
+                
+                # TODO: during RL stage get_per_token_logps(), the generated tokens might be visual tokens, which disturbs boundary computation here
+                # NOTE-ZY: original boundary definition
+                # 找到所有的 [<|vision_start|>index, <|vision_end|>index] 的pairs，标注每一帧的起点与终点
+                vision_start_token_idx = (torch.where(input_ids_1d == vision_start_token_id)[0]).tolist()  # list of idx
+                vision_end_token_idx = (torch.where(input_ids_1d == vision_end_token_id)[0]).tolist()  # list of idx
+                vision_start_end_idx_pairs = list(zip(vision_start_token_idx, vision_end_token_idx))  # list of (start_idx, end_idx)
+                assert len(vision_start_end_idx_pairs) == T, f"找到的 <|vision_start|>/<|vision_end|> pairs 数量 ({len(vision_start_end_idx_pairs)}) 与 T ({T}) 不匹配"
+                # 找到最后一个 <|vision_end|>，即为 question token start idx 【末尾的非视觉token】
+                q_start_idx = max(vision_end_token_idx) + 1
+                # 修改boundary为 [[多对 [<|vision_start|>index, <|vision_end|>index]], q_start_idx, #tokens]
+                num_tokens = input_ids.shape[1]
+                boundaries_b = [vision_start_end_idx_pairs, q_start_idx, num_tokens] # boundary，此时input_ids已经有压缩vis token
+                
+                updated_embeds_chunks = []
+                updated_raw_ids_chunks = []
+                updated_raw_mask_chunks = []
+                
+                # vis_feats shape is [T, Merged_H_W, C] (e.g., [8, 30, 4096])
+                merged_embeds_per_frame = vis_feats 
+                
+                # Raw (unmerged) visual tokens
+                raw_vis_ids_per_frame = torch.full((H * W,), vis_token_id, dtype=input_ids.dtype, device=input_ids.device) # shape [120]
+                if attention_mask_1d is not None:
+                    raw_vis_mask_per_frame = torch.full((H * W,), 1, dtype=attention_mask.dtype, device=attention_mask.device) # shape [120]
+
+                last_idx = 0
+                for i in range(T):
+                    start_idx = vision_start_end_idx_pairs[i][0]
+                    end_idx = vision_start_end_idx_pairs[i][1]
+                    
+                    # inputs_embeds_b
+                    updated_embeds_chunks.append(inputs_embeds[0, last_idx:start_idx])      # 添加此 image chunk 之前的 文本部分 (e.g., <|im_start|>user\n<19.6 seconds>)
+                    updated_embeds_chunks.append(inputs_embeds[0, start_idx:start_idx+1])   # <|vision_start|>
+                    updated_embeds_chunks.append(merged_embeds_per_frame[i])                # token compression后的30个<|image_pad|>
+                    updated_embeds_chunks.append(inputs_embeds[0, end_idx:end_idx+1])       # <|vision_end|>
+                    
+                    # raw_input_ids_b
+                    updated_raw_ids_chunks.append(input_ids_1d[last_idx:start_idx])
+                    updated_raw_ids_chunks.append(input_ids_1d[start_idx:start_idx+1])
+                    updated_raw_ids_chunks.append(raw_vis_ids_per_frame)                    # 未进行token compression的120个<|image_pad|>的input_ids
+                    updated_raw_ids_chunks.append(input_ids_1d[end_idx:end_idx+1])
+
+                    # raw_attention_mask_b
+                    if attention_mask_1d is not None:
+                        updated_raw_mask_chunks.append(attention_mask_1d[last_idx:start_idx])
+                        updated_raw_mask_chunks.append(attention_mask_1d[start_idx:start_idx+1])
+                        updated_raw_mask_chunks.append(raw_vis_mask_per_frame)              # 未进行token compression的120个<|image_pad|>的masks
+                        updated_raw_mask_chunks.append(attention_mask_1d[end_idx:end_idx+1])
+                        
+                    # 更新下一个文本块的起始索引
+                    last_idx = end_idx + 1
+
+                # 添加最后一个 image chunk 之后的 文本部分 (e.g., Describe this image.<|im_end|>\n<|im_start|>assistant\n)
+                updated_embeds_chunks.append(inputs_embeds[0, last_idx:])
+                inputs_embeds_b = torch.cat(updated_embeds_chunks, dim=0).unsqueeze(0) # [1, L, C], e.g., torch.Size([1, 330, 4096])
+                
+                updated_raw_ids_chunks.append(input_ids_1d[last_idx:])
+                raw_input_ids_b = torch.cat(updated_raw_ids_chunks, dim=0).unsqueeze(0) # [1, Raw_L], e.g., torch.Size([1, 1050, 4096])
+
+                # convert attention_mask to the length before any token reduction
+                if attention_mask_1d is not None: # prefill stage
+                    updated_raw_mask_chunks.append(attention_mask_1d[last_idx:])
+                    raw_attention_mask_b = torch.cat(updated_raw_mask_chunks, dim=0).unsqueeze(0) # [1, Raw_L]
+                else: # RL stage get_per_token_logps() # prefill内有个子分支关于RL
+                    raw_attention_mask_b = None
+                    
+                # import pdb; pdb.set_trace()
+                inputs_embeds = inputs_embeds_b 
+                    # transformers/models/qwen3_vl/processing_qwen3_vl.py has already align their length  
+                    # e.g., torch.Size([1, 330, 4096])
+                raw_input_ids = raw_input_ids_b
+                    # e.g., torch.Size([1, 1050])
+                raw_attention_mask = raw_attention_mask_b
+                    # e.g., torch.Size([1, 1050, 4096])
+                boundaries = boundaries_b 
+                    # [[多对 [<|vision_start|>index, <|vision_end|>index]], #tokens]
+                    # e.g., [[(10, 41), (49, 80), (89, 120), (129, 160), (169, 200), (209, 240), (249, 280), (289, 320)], 321, 330]
+                vis_grid_thw = image_grid_thw 
+                
                 
         # prefilling stage or RL stage get_per_token_logps()
         if pixel_values_videos is not None: # 视频
