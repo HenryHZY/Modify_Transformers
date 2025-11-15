@@ -44,9 +44,8 @@ class CacheLayerMixin(ABC):
         self, key_states: torch.Tensor, value_states: torch.Tensor, cache_kwargs: Optional[dict[str, Any]] = None
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
-    # TODO: 添加新变量
     @abstractmethod
-    def get_mask_sizes(self, cache_position: torch.Tensor, compression_prefill: bool, compression_decode: bool) -> tuple[int, int]: ...
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]: ...
 
     @abstractmethod
     def get_seq_length(self) -> int: ...
@@ -121,32 +120,18 @@ class DynamicLayer(CacheLayerMixin):
         self.values = torch.cat([self.values, value_states], dim=-2)
         return self.keys, self.values
 
-    def get_mask_sizes(self, cache_position: torch.Tensor,
-                        compression_prefill=False,
-                        compression_decode=False,
-                       ) -> tuple[int, int]:
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
         """Return the length and offset of the cache, used to generate the mask"""
-        # import pdb; pdb.set_trace()
         kv_offset = 0
         query_length = cache_position.shape[0]
-        
-        # kv_length = self.get_seq_length() + query_length
-        if not compression_prefill and not compression_decode: # original
-            past_seen_tokens = self.get_seq_length()
-        elif compression_prefill: # ours
-            past_seen_tokens = 0
-        elif compression_decode: # ours
-            past_seen_tokens = cache_position.item() # TODO: need to fix?
-
-        kv_length = past_seen_tokens + query_length
-        
+        kv_length = self.get_seq_length() + query_length
         return kv_length, kv_offset
 
     def get_seq_length(self) -> int:
         """Returns the sequence length of the cached states."""
         if not self.is_initialized or self.keys.numel() == 0:
             return 0
-        return self.keys.shape[-2] # TODO: at prefill stage: self.keys.shape = torch.Size([1, 8, 330, 128])
+        return self.keys.shape[-2]
 
     def get_max_cache_shape(self) -> int:
         """Returns the maximum sequence length of the cache object. DynamicLayer does not have a maximum length."""
@@ -225,10 +210,7 @@ class DynamicSlidingWindowLayer(DynamicLayer):
         # Return the full states
         return full_key_states, full_value_states
 
-    def get_mask_sizes(self, cache_position: torch.Tensor,
-                        compression_prefill=False,
-                        compression_decode=False,
-                       ) -> tuple[int, int]:
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
         """Return the length and offset of the cache, used to generate the attention mask"""
         query_length = cache_position.shape[0]
         is_full = self.cumulative_length >= self.sliding_window
@@ -355,10 +337,7 @@ class StaticLayer(CacheLayerMixin):
             self.values[:, :, cache_position] = value_states
         return self.keys, self.values
 
-    def get_mask_sizes(self, cache_position: torch.Tensor,
-                        compression_prefill=False,
-                        compression_decode=False,
-                       ) -> tuple[int, int]:
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
         """Return the length and offset of the cache, used to generate the attention mask"""
         kv_offset = 0
         kv_length = self.max_cache_len
@@ -476,10 +455,7 @@ class StaticSlidingWindowLayer(StaticLayer):
         # we should return the whole states instead of `self.keys/values` here, as otherwise we lose some context
         return full_key_states, full_value_states
 
-    def get_mask_sizes(self, cache_position: torch.Tensor,
-                        compression_prefill=False,
-                        compression_decode=False,
-                       ) -> tuple[int, int]:
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
         """Return the length and offset of the cache, used to generate the attention mask"""
         query_length = cache_position.shape[0]
         sliding_window = self.max_cache_len
@@ -825,9 +801,7 @@ class Cache:
             return 0
         return self.layers[layer_idx].get_seq_length()
 
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int,
-                        compression_prefill=False,
-                        compression_decode=False) -> tuple[int, int]:
+    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
         """
         Return a tuple (kv_length, kv_offset) corresponding to the length and offset that will be returned for
         the given layer at `layer_idx`.
@@ -837,7 +811,7 @@ class Cache:
         # simply the shape of `cache_position`
         if layer_idx >= len(self.layers):
             return cache_position.shape[0], 0
-        return self.layers[layer_idx].get_mask_sizes(cache_position, compression_prefill=compression_prefill, compression_decode=compression_decode)
+        return self.layers[layer_idx].get_mask_sizes(cache_position)
 
     def get_max_cache_shape(self, layer_idx: int = 0) -> int:
         """Returns maximum sequence length of the cache object. Dynamic caches do not have a maximum length."""
@@ -1383,10 +1357,7 @@ class EncoderDecoderCache(Cache):
         """Returns the maximum sequence length (i.e. max capacity) of the cache object"""
         return self.self_attention_cache.get_max_cache_shape()
 
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int,
-                        compression_prefill=False,
-                        compression_decode=False,
-                       ) -> tuple[int, int]:
+    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
         return self.self_attention_cache.get_mask_sizes(cache_position, layer_idx)
 
     @property

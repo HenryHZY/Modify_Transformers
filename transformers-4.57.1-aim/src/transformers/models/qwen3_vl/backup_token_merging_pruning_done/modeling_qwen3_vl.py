@@ -27,7 +27,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache
+from ...cache_utils import Cache, DynamicCache, StaticCache, SlidingWindowCache
+from ...modeling_attn_mask_utils import AttentionMaskConverter
 from ...generation import GenerationMixin
 from ...integrations import use_kernel_forward_from_hub
 from ...masking_utils import create_causal_mask
@@ -43,6 +44,7 @@ from ...utils.generic import check_model_inputs
 from .configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 import einops
 import copy
+import numpy as np
 
 class Qwen3VLVisionMLP(nn.Module):
     def __init__(self, config):
@@ -488,7 +490,7 @@ class Qwen3VLTextAttention(nn.Module):
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward_with_pruning
-        if self.config._attn_implementation != "eager": # NOTE-ZY: e.g., "flash_attention_2" 
+        if self.config._attn_implementation != "eager": # NOTE-ZY: e.g., "flash_attention_2" # TODO: 似乎这个没有切换到pruning时的eager mode
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
         
         # attn_output, attn_weights = attention_interface()
@@ -538,7 +540,6 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
         
         # self.self_attn = Qwen3VLTextAttention(config=config, layer_idx=layer_idx)
         if not do_pruning: # NOTE-ZY: normally, use Qwen3VLTextAttention with attn_implementation="flash_attention_2"
-            # import pdb; pdb.set_trace()
             config_temp = copy.deepcopy(config)
             assert config_temp._attn_implementation == "flash_attention_2"
             self.self_attn = Qwen3VLTextAttention(config=config_temp, layer_idx=layer_idx)
@@ -550,6 +551,7 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
             assert config_temp._attn_implementation == "eager"
             self.self_attn = Qwen3VLTextAttention(config=config_temp, layer_idx=layer_idx)
             self.self_attn_type = "eager"
+            assert config_temp._attn_implementation == "eager"
 
         self.mlp = Qwen3VLTextMLP(config)
         self.input_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -573,6 +575,13 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
         
         # eager: hidden_states, _, importance_score = self.self_attn
         # others: hidden_states, _, _ = self.self_attn
+        if self.layer_idx_temp == 18:
+            assert self.self_attn_type == "eager"
+            # import pdb; pdb.set_trace()
+            # NOTE-ZY: 实际上，此时 self.config_temp._attn_implementation = 'flash_attention_2，而我们后续应该要根据self.self_attn_type来进行force eager
+                # fix: 让 self.config_temp._attn_implementation = self.self_attn_type
+            # TODO: 目前在prefill阶段，if do pruning有出现error
+        
         # NOTE-ZY: 
         # 在is_prefill阶段：
         #   attention_mask = None for flash attn; 
@@ -588,7 +597,10 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        # if outputs[2] != None: # NOTE-ZY: 正常情况下，使用attn_implementation="flash_attention_2"时，importance_score!=None对应 layer_idx wit pruning，也就是Do pruning: layer 18,19,20,21,22
+        # if outputs[2] != None:
+            # import pdb; pdb.set_trace()
+            # NOTE-ZY: 正常情况下，使用attn_implementation="flash_attention_2"时，importance_score!=None对应 layer_idx wit pruning，也就是Do pruning: layer 18,19,20,21,22
+            
         hidden_states = outputs[0] # torch.Size([1, 330, 4096])
         importance_score = outputs[2] if len(outputs) > 2 else None # outputs[2] = None or torch.Size([1, 330])
         hidden_states = residual + hidden_states
@@ -630,9 +642,7 @@ class Qwen3VLModelOutputWithPast(ModelOutput):
     run_our_forward: Optional[bool] = None
     is_prefill: Optional[bool] = None
     rl_forward: Optional[bool] = None
-    initial_boundaries: Optional[list[torch.LongTensor]] = None
-    final_boundaries: Optional[list[torch.LongTensor]] = None
-    input_ids: Optional[torch.LongTensor] = None
+    boundaries: Optional[list[torch.LongTensor]] = None
 
 @auto_docstring
 class Qwen3VLPreTrainedModel(PreTrainedModel):
@@ -907,6 +917,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+        # import pdb; pdb.set_trace()
         self.config = config
 
     @check_model_inputs
@@ -953,8 +964,6 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             The feature is extracted from the different visual encoder layers, and fed to the decoder
             hidden states. It's from the paper DeepStack(https://arxiv.org/abs/2406.04334).
         """
-        # print(f"class Qwen3VLTextModel.forward()开头 -> input_ids.shape = {input_ids.shape}")
-        
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -971,6 +980,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
+        # import pdb; pdb.set_trace()
         # the hard coded `3` is for temporal, height and width.
         if position_ids is None:
             position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
@@ -981,7 +991,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
         else:
-            text_position_ids = position_ids[0] # NOTE-ZY: position_ids.ndim == 3 and position_ids.shape[0] == 3, 进入这个，取得temporal pos用于create_causal_mask()
+            text_position_ids = position_ids[0] # NOTE-ZY: position_ids.ndim == 3 and position_ids.shape[0] == 3, 进入这个，temporal pos
         
         # NOTE-ZY: 
         # 正常情况下，若使用attn_implementation="flash_attention_2"：
@@ -993,6 +1003,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         # token pruning + 使用attn_implementation="flash_attention_2"
             # 此处刚开始forward还是默认用attn_implementation="flash_attention_2"，因此此处的causal_mask一直为None
         
+        # import pdb; pdb.set_trace() 
         # NOTE-ZY: 这里会覆盖之前的 attention_mask，但后续 token pruning操作与输入的attention_mask相关需要重新生成causal_mask -> 此处用新变量名
         # NOTE-ZY: create_causal_mask()函数前后，所有输入都无变化
         # attention_mask = create_causal_mask(
@@ -1002,7 +1013,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             attention_mask=attention_mask, # torch.Size([1, 330])，全为1 # NOTE-ZY: checked: video-r1也如此
             cache_position=cache_position, # torch.Size([330]), tensor([  0,   1,   2, ..., 329]
             past_key_values=past_key_values, 
-            position_ids=text_position_ids, # torch.Size([1, 330]), text's rope # NOTE-ZY: create causal mask输入使用的是torch.Size([1, 330])这种，而不是3D的
+            position_ids=text_position_ids, # torch.Size([1, 330]), text's rope # TODO: create causal mask输入使用的是torch.Size([1, 330])这种，而不是3D的
         )
         
         is_prefill = past_key_values is None or past_key_values.get_seq_length() == 0
@@ -1075,7 +1086,6 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers): # NOTE-ZY: LLM内的每一层，需要考虑prefill / decoding stage，是否切换eager / flash attn
-            # NOTE-ZY: check了env video-r1，逻辑差不多
             # if layer_idx == 17 or layer_idx == 18 or layer_idx == 19 or layer_idx == 22 or layer_idx == 23: # flash attn -> eager attn -> eager attn -> flash attn
                 # print(f"layer_idx = {layer_idx}")
                 # import pdb; pdb.set_trace()
@@ -1091,6 +1101,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 # text_position_ids.shape = torch.Size([1, 330])
                 # past_key_values.get_seq_length() = 330
                 # position_embeddings[0].shape = torch.Size([1, 330, 128])
+                # TODO: check video-r1那边
                 
                 # layer_idx = 18 with pruning, eager
                 # hidden_states.shape = torch.Size([1, 330, 4096])
@@ -1167,6 +1178,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                     # 【如果是纯eager，会OOM】
                     if is_prefill: # prefill phrase or RL stage get_per_token_logps()
                         # print(f"at prefill stage: layer_idx = {layer_idx} without pruning")
+                        
                         self.attention_mask_cache[layer_idx + 1] = attention_mask
                         self.position_ids_cache[layer_idx + 1] = position_ids
                         self.boundaries_cache[layer_idx + 1] = boundaries
@@ -1174,18 +1186,23 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                         
                         if (layer_idx + 1) < len(self.layers): # NOTE-ZY: 本层与下一层的衔接
                             if self.layers[layer_idx + 1].self_attn_type == 'eager': # layer transition: recompute mask for next layer (eager type)
+                                # import pdb; pdb.set_trace()
                                 # NOTE-ZY: prefill stage，下一层是eager，为下一层生成4D causal_mask
                                     # 当前layer_idx = 17是flash attn，下一层是eager
                                     # causal_mask -> torch.Size([1, 1, 330, 330])
+                                # causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_prefill=True)
+                                
                                 config_temp = copy.deepcopy(self.config)
                                 config_temp._attn_implementation = "eager"
                                 text_position_ids=position_ids[0]
                                 assert hidden_states.shape[1] == text_position_ids.shape[1], f"hidden_states.shape[1] = {hidden_states.shape[1]} != text_position_ids.shape[1] = {text_position_ids.shape[1]}"
                                 causal_mask_temp = create_causal_mask(config=config_temp, input_embeds=hidden_states, attention_mask=attention_mask, cache_position=cache_position, past_key_values=past_key_values, position_ids=text_position_ids, compression_prefill=True, compression_decode=False)
                                 causal_mask = causal_mask_temp
+                                # import pdb; pdb.set_trace()
                                 
-                    else: # decoding phrase (append new token) # NOTE-ZY: 先看prefill stage，再看decoding stage
+                    else: # decoding phrase (append new token) # TODO: 先看prefill stage，再看decoding stage
                         # get variables of next layer from prefill cache
+                        # import pdb; pdb.set_trace()
                         attention_mask = self.attention_mask_cache[layer_idx + 1] # len=37，用1~37共36层
                         position_ids = self.position_ids_cache[layer_idx + 1] 
                         cache_position = self.cache_position_cache[layer_idx + 1] 
@@ -1200,6 +1217,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                         cache_position = torch.arange(seq_length, device=cache_position.device) + cache_position[-1].item() + 1 # cache position for input token
                             # tensor([330], device='cuda:0')
                             # NOTE: cache_position value would decrease as layer goes deeper, yet position_ids should keep increasing as if there was no token compression
+                        # import pdb; pdb.set_trace()
                         reduct_cnt = self.boundaries_cache[layer_idx][1] - self.boundaries_cache[layer_idx + 1][1] # NOTE-ZY: 相当于q start idx相减算出reduct_cnt
                         running_rope_deltas += reduct_cnt
                             # running_rope_deltas = tensor([[-120]], device='cuda:0')
@@ -1216,6 +1234,9 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                         # re-compute for next layer
                         if (layer_idx + 1) < len(self.layers):
                             if self.layers[layer_idx + 1].self_attn_type == 'eager': # layer transition: recompute mask for next layer (eager type)
+                                # import pdb; pdb.set_trace()
+                                # causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
+
                                 config_temp = copy.deepcopy(self.config)
                                 config_temp._attn_implementation = "eager"
                                 text_position_ids=position_ids[0]
@@ -1234,7 +1255,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                     # importance_score is not None -> 当前layer是eager attention的layer -> 需要做token pruning的操作
                     # 同样分为prefill stage和decoding stage
                     # import pdb; pdb.set_trace()
-                    if importance_score == 'decoding': # decoding phrase # NOTE-ZY: 先看prefill stage，再看decoding stage
+                    if importance_score == 'decoding': # decoding phrase # TODO: 先看prefill stage
                         # append new token # 为了一个新token，并且真的丢掉
                         # get variables of next layer from prefill cache
                         # import pdb; pdb.set_trace()
@@ -1256,18 +1277,22 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                         if cache_position is not None:  # otherwise `deltas` is an int `0`
                             delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
                         position_ids = position_ids.add(delta)
-                        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+                        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1) # TODO: 是否需要调整text pos？
 
                         # re-compute for next layer
                         if (layer_idx + 1) < len(self.layers):
                             if self.layers[layer_idx + 1].self_attn_type != 'eager': # layer transition: recompute mask for next layer (flash attn type)
-                                causal_mask = create_causal_mask(config=self.config, input_embeds=hidden_states, attention_mask=attention_mask, cache_position=cache_position, past_key_values=past_key_values, position_ids=text_position_ids) 
-                                # NOTE-ZY: 用这个还是下面的（video-r1环境的实现） -> 都能正常infer，还是优先用official的实现
+                                # import pdb; pdb.set_trace()
+                                # causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions)
+                                causal_mask = create_causal_mask(config=self.config, input_embeds=hidden_states, attention_mask=attention_mask, cache_position=cache_position, past_key_values=past_key_values, position_ids=text_position_ids) # TODO: 用这个还是下面的？
                                 # if attention_mask is not None and 0.0 in attention_mask:
                                 #     causal_mask = attention_mask
                                 # else:
                                 #     causal_mask = None
                             else: # continue to be eager layer type
+                                # import pdb; pdb.set_trace()
+                                # causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_decode=True)
+                                
                                 config_temp = copy.deepcopy(self.config)
                                 config_temp._attn_implementation = "eager"
                                 text_position_ids=position_ids[0]
@@ -1285,6 +1310,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                     else: 
                         # prefill phrase
                         # print(f"at prefill stage: layer_idx = {layer_idx} with pruning")
+                        
                         # set random scores if nan appears so that no protected tokens are pruned
                         if torch.isnan(importance_score).any().item():
                             print("Got nan in importance_score!")
@@ -1307,21 +1333,21 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                             #     324, 325, 326, 327, 328, 329], device='cuda:0')]
                         
                         # NOTE-ZY: 每次应该 protected_token_indices.shape 是相同的
-                            # print(f"boundaries = {boundaries}")
-                            # print(f"protected_token_indices = {protected_token_indices}")
-                            # print(f"protected_token_indices.shape = {protected_token_indices.shape}")
-                            # print(f"importance_score.shape = {importance_score.shape}")
-                            # boundaries = [[(10, 41), (49, 80), (89, 120), (129, 160), (169, 200), (209, 240), (249, 280), (289, 320)], 321, 330]
-                            # protected_token_indices = tensor([  0,   1,   2,   3,   4,   5,   6,   7,   8,   9,  10,  41,  42,  43,
-                            #         44,  45,  46,  47,  48,  49,  80,  81,  82,  83,  84,  85,  86,  87,
-                            #         88,  89, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 160, 161,
-                            #         162, 163, 164, 165, 166, 167, 168, 169, 200, 201, 202, 203, 204, 205,
-                            #         206, 207, 208, 209, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249,
-                            #         280, 281, 282, 283, 284, 285, 286, 287, 288, 289, 320, 321, 322, 323,
-                            #         324, 325, 326, 327, 328, 329], device='cuda:0')
-                            # protected_token_indices.shape = torch.Size([90])
-                            # importance_score.shape = torch.Size([1, 330])
-                            
+                        # print(f"boundaries = {boundaries}")
+                        # print(f"protected_token_indices = {protected_token_indices}")
+                        # print(f"protected_token_indices.shape = {protected_token_indices.shape}")
+                        # print(f"importance_score.shape = {importance_score.shape}")
+                        # boundaries = [[(10, 41), (49, 80), (89, 120), (129, 160), (169, 200), (209, 240), (249, 280), (289, 320)], 321, 330]
+                        # protected_token_indices = tensor([  0,   1,   2,   3,   4,   5,   6,   7,   8,   9,  10,  41,  42,  43,
+                        #         44,  45,  46,  47,  48,  49,  80,  81,  82,  83,  84,  85,  86,  87,
+                        #         88,  89, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 160, 161,
+                        #         162, 163, 164, 165, 166, 167, 168, 169, 200, 201, 202, 203, 204, 205,
+                        #         206, 207, 208, 209, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249,
+                        #         280, 281, 282, 283, 284, 285, 286, 287, 288, 289, 320, 321, 322, 323,
+                        #         324, 325, 326, 327, 328, 329], device='cuda:0')
+                        # protected_token_indices.shape = torch.Size([90])
+                        # importance_score.shape = torch.Size([1, 330])
+                        # import pdb; pdb.set_trace()
                         importance_score[0, protected_token_indices] = 1.0 
                             # importance_score: (B, N), e.g., torch.Size([1, 330])
                             # importance_score[0, protected_token_indices].shape = torch.Size([90])
@@ -1331,11 +1357,12 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                         # the indices we kept
                         keep_inds_1d = inds[0, :keep_num].to(hidden_states.device) # torch.Size([1, 282])
                         
-                        # 计算被删除的 token 索引
+                        # --- 新增逻辑：计算被删除的 token 索引 ---
                         original_num_tokens = importance_score.shape[1]
                         all_indices_set = set(range(original_num_tokens))
                         keep_indices_set = set(keep_inds_1d.cpu().numpy())
                         deleted_indices_set = all_indices_set - keep_indices_set
+                        # ------------------------------------
                         
                         keep_inds_1d_sorted, _ = torch.sort(keep_inds_1d, dim=-1) # 恢复顺序
 
@@ -1348,10 +1375,11 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                         # adjust boundaries for next layer 
                         # import pdb; pdb.set_trace()
                         adjusted_boundaries = boundaries # [[多对 [<|vision_start|>index, <|vision_end|>index]], q_start_idx, #tokens]
+                        # adjusted_boundaries[0]
                             # adjusted_boundaries[0] -> v star, v end pairs 
                             # NOTE-ZY: pruning之后，每组的v start idx、v end idx理应进行调整
                         
-                        # 调整 Boundaries
+                        # --- 4. 调整 Boundaries (使用您纠正后的新逻辑) ---
                         adjusted_boundaries = boundaries 
                         new_vision_boundaries = []
                         cumulative_reduct_cnt = 0 # 记录到目前为止总共删除了多少 token
@@ -1375,11 +1403,12 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                         # 更新 vision boundaries 列表
                         adjusted_boundaries[0] = new_vision_boundaries
 
-                        # 更新 q_start 和 total_tokens ---
+                        # --- 5. 更新 q_start 和 total_tokens ---
                         # 循环结束时，cumulative_reduct_cnt == total_reduct_cnt
                         # 这里的 total_reduct_cnt 应该等于 len(deleted_indices_set)
                         total_reduct_cnt = cumulative_reduct_cnt 
 
+                        # (可选的断言检查)
                         _expected_reduct_cnt = importance_score.shape[1] - hidden_states.shape[1]
                         assert total_reduct_cnt == _expected_reduct_cnt, "Pruning 计数不一致" 
                                                    
@@ -1391,7 +1420,6 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                         adjusted_boundaries[2] = adjusted_boundaries[2] - reduct_cnt 
                             # end+1 token move right (padding) and then move left (visual compression)
                             # 330 - 48 = 282 -> num_token
-                        assert hidden_states.size(1) == adjusted_boundaries[2], "Pruning 后的 token 数量不匹配"
                         
                         # outputs to next layer
                         # hidden_states = hidden_states
@@ -1404,13 +1432,26 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                         # re-compute critical variables for next layer
                         if (layer_idx + 1) < len(self.layers):
                             if self.layers[layer_idx + 1].self_attn_type != 'eager': # layer transition: recompute mask for next layer (flash attn type)
-                                causal_mask = create_causal_mask(config=self.config, input_embeds=hidden_states, attention_mask=attention_mask, cache_position=cache_position, past_key_values=past_key_values, position_ids=text_position_ids) 
-                                # NOTE-ZY: 用这个还是下面的（video-r1环境的实现） -> 都能正常infer，还是优先用official的实现
+                                # import pdb; pdb.set_trace()
+                                # causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions) 
+                                causal_mask = create_causal_mask(config=self.config, input_embeds=hidden_states, attention_mask=attention_mask, cache_position=cache_position, past_key_values=past_key_values, position_ids=text_position_ids) # TODO: 用这个还是下面的？
                                 # if attention_mask is not None and 0.0 in attention_mask:
                                 #     causal_mask = attention_mask
                                 # else:
                                 #     causal_mask = None
+                                
+                                # self.config._attn_implementation = 'flash_attention_2' -> causal_mask = None # TODO: 这个应该是当前层的？ self.config._attn_implementation
+                                # causal_mask = create_causal_mask(config=self.config, input_embeds=hidden_states, attention_mask=attention_mask, cache_position=cache_position, past_key_values=past_key_values, position_ids=text_position_ids)
+                                # hidden_states.shape = torch.Size([1, 90, 4096])
+                                # attention_mask.shape = torch.Size([1, 90])
+                                # cache_position.shape = tensor([ 0,  1,  2,  3,  4,  5,  6, ..., 86, 87, 88, 89])
+                                # past_key_values.get_seq_length() = 330 # TODO: 是否有问题？
+                                # text_position_ids.shape = torch.Size([1, 330]) # TODO: 是否有问题？
+                                # causal_mask = None
+                                
                             else: # continue to be eager layer type
+                                # import pdb; pdb.set_trace()
+                                # causal_mask = self._update_causal_mask(attention_mask, hidden_states, cache_position, past_key_values, output_attentions, force_eager=True, compression_prefill=True)
                                 config_temp = copy.deepcopy(self.config)
                                 config_temp._attn_implementation = "eager"
                                 text_position_ids=position_ids[0]
@@ -1418,21 +1459,23 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                                 causal_mask_temp = create_causal_mask(config=config_temp, input_embeds=hidden_states, attention_mask=attention_mask, cache_position=cache_position, past_key_values=past_key_values, position_ids=text_position_ids, compression_prefill=True, compression_decode=False)
                                 causal_mask = causal_mask_temp # NOTE-ZY: torch.Size([1, 1, 282, 282])，适配刚刚的token pruning
                         
+                        # import pdb; pdb.set_trace()
+                        # hidden_states.shape torch.Size([3, 1, 282])
+                        # position_ids.shape torch.Size([3, 1, 282])
+                        # update position_embeddings -> position_embeddings[0].shape = torch.Size([1, 330, 128])
                         position_embeddings = self.rotary_emb(hidden_states, position_ids) # computed w.r.t. position_ids values, irrelevant to hidden_states values
                         text_position_ids = position_ids[0]
-                            # hidden_states.shape torch.Size([3, 1, 282])
-                            # position_ids.shape torch.Size([3, 1, 282])
-                            # update position_embeddings -> position_embeddings[0].shape = torch.Size([1, 330, 128])
-
+                        
                         protected_inds, protected_num = get_protected_info(boundaries, hidden_states) 
-                            # print(f"boundaries = {boundaries}")
-                            # print(f"hidden_states.shape = {hidden_states.shape}")
-                            # print(f"protected_inds.shape = {protected_inds.shape}")
-                            # print(f"protected_num = {protected_num}")
-                            # boundaries = [[[10, 26], [34, 61], [70, 100], [109, 131], [140, 165], [174, 200], [209, 237], [246, 272]], 273, 282]
-                            # hidden_states.shape = torch.Size([1, 282, 4096])
-                            # protected_inds.shape = torch.Size([90, 2])
-                            # protected_num = tensor([90], device='cuda:0')
+                        # print(f"boundaries = {boundaries}")
+                        # print(f"hidden_states.shape = {hidden_states.shape}")
+                        # print(f"protected_inds.shape = {protected_inds.shape}")
+                        # print(f"protected_num = {protected_num}")
+                        # boundaries = [[[10, 26], [34, 61], [70, 100], [109, 131], [140, 165], [174, 200], [209, 237], [246, 272]], 273, 282]
+                        # hidden_states.shape = torch.Size([1, 282, 4096])
+                        # protected_inds.shape = torch.Size([90, 2])
+                        # protected_num = tensor([90], device='cuda:0')
+                        # import pdb; pdb.set_trace()
 
                 layer_idx += 1
             ############# token pruning #############
@@ -1452,6 +1495,180 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
         hidden_states[visual_pos_masks, :] = local_this
         return hidden_states
+
+    # NOTE-ZY: bring back old implementation from qwen2_5_vl_video_r1/modeling_qwen2_5_vl.py
+    # NOTE-ZY: 'Qwen3VLTextConfig' object has no attribute 'sliding_window'
+    def _update_causal_mask(
+        self,
+        attention_mask: torch.Tensor,
+        input_tensor: torch.Tensor,
+        cache_position: torch.Tensor,
+        past_key_values: Cache,
+        output_attentions: bool,
+        compression_prefill=False,
+        compression_decode=False,
+        force_eager=False,
+    ):
+        if not force_eager: # TODO: 这里应该是为了应对非pruning layer的，但是意义是什么？
+            if self.config._attn_implementation == "flash_attention_2":
+                if attention_mask is not None and past_key_values is not None:
+                    is_padding_right = attention_mask[:, -1].sum().item() != input_tensor.size()[0]
+                    if is_padding_right:
+                        raise ValueError(
+                            "You are attempting to perform batched generation with padding_side='right'"
+                            " this may lead to unexpected behaviour for Flash Attention version of Qwen2_5_VL. Make sure to "
+                            " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
+                        )
+                if attention_mask is not None and 0.0 in attention_mask:
+                    return attention_mask
+                return None
+
+        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
+        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
+        # to infer the attention mask.
+        # past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        ############### NOTE-15: temporarily edited by 15 ###############
+        # print(compression_prefill, compression_decode, past_key_values.get_seq_length())
+        if not compression_prefill and not compression_decode: # original
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        elif compression_prefill: # ours
+            past_seen_tokens = 0
+        elif compression_decode: # ours
+            past_seen_tokens = cache_position.item()
+        ############### NOTE-15: temporarily edited by 15 ###############
+        using_static_cache = isinstance(past_key_values, StaticCache)
+        using_sliding_window_cache = isinstance(past_key_values, SlidingWindowCache)
+
+        # NOTE-ZY: fix AttributeError: 'Qwen3VLTextConfig' object has no attribute 'sliding_window'
+        if 'sliding_window' not in self.config:
+            self.config.sliding_window = None
+            
+        # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
+        if (
+            self.config._attn_implementation == "sdpa"
+            and not (using_static_cache or using_sliding_window_cache)
+            and not output_attentions
+        ):
+            if AttentionMaskConverter._ignore_causal_mask_sdpa(
+                attention_mask,
+                inputs_embeds=input_tensor,
+                past_key_values_length=past_seen_tokens,
+                sliding_window=self.config.sliding_window,
+                is_training=self.training,
+            ):
+                return None
+
+        dtype, device = input_tensor.dtype, input_tensor.device
+        min_dtype = torch.finfo(dtype).min
+        sequence_length = input_tensor.shape[1]
+        # SlidingWindowCache or StaticCache
+        if using_sliding_window_cache or using_static_cache:
+            target_length = past_key_values.get_max_cache_shape()
+        # DynamicCache or no cache
+        else:
+            target_length = (
+                attention_mask.shape[-1]
+                if isinstance(attention_mask, torch.Tensor)
+                else past_seen_tokens + sequence_length + 1
+            )
+
+        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
+        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
+            attention_mask,
+            sequence_length=sequence_length,
+            target_length=target_length,
+            dtype=dtype,
+            device=device,
+            cache_position=cache_position,
+            batch_size=input_tensor.shape[0],
+            config=self.config,
+            past_key_values=past_key_values,
+        )
+
+        if (
+            self.config._attn_implementation == "sdpa"
+            and attention_mask is not None
+            and attention_mask.device.type in ["cuda", "xpu"]
+            and not output_attentions
+        ):
+            # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
+            # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
+            # Details: https://github.com/pytorch/pytorch/issues/110213
+            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+
+        return causal_mask
+
+    # NOTE-ZY: bring back old implementation from qwen2_5_vl_video_r1/modeling_qwen2_5_vl.py
+    @staticmethod
+    def _prepare_4d_causal_attention_mask_with_cache_position(
+        attention_mask: torch.Tensor,
+        sequence_length: int,
+        target_length: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        cache_position: torch.Tensor,
+        batch_size: int,
+        config: Qwen3VLConfig,
+        past_key_values: Cache,
+    ):
+        """
+        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
+        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
+
+        Args:
+            attention_mask (`torch.Tensor`):
+                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape `(batch_size, 1, query_length, key_value_length)`.
+            sequence_length (`int`):
+                The sequence length being processed.
+            target_length (`int`):
+                The target length: when generating with static cache, the mask should be as long as the static cache, to account for the 0 padding, the part of the cache that is not filled yet.
+            dtype (`torch.dtype`):
+                The dtype to use for the 4D attention mask.
+            device (`torch.device`):
+                The device to plcae the 4D attention mask on.
+            cache_position (`torch.Tensor`):
+                Indices depicting the position of the input sequence tokens in the sequence.
+            batch_size (`torch.Tensor`):
+                Batch size.
+            config (`Qwen2_5_VLConfig`):
+                The model's configuration class
+            past_key_values (`Cache`):
+                The cache class that is being used currently to generate
+        """
+        if attention_mask is not None and attention_mask.dim() == 4:
+            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
+            causal_mask = attention_mask
+        else:
+            min_dtype = torch.finfo(dtype).min
+            causal_mask = torch.full(
+                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
+            )
+            diagonal_attend_mask = torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+            if config.sliding_window is not None:
+                # if we have sliding window, we should not attend to tokens beyond sliding window length, so we mask them out also
+                # the check is needed to verify is current checkpoint was trained with sliding window or not
+                if not isinstance(past_key_values, SlidingWindowCache) or sequence_length > target_length:
+                    sliding_attend_mask = torch.arange(target_length, device=device) <= (
+                        cache_position.reshape(-1, 1) - config.sliding_window
+                    )
+                    diagonal_attend_mask.bitwise_or_(sliding_attend_mask)
+            causal_mask *= diagonal_attend_mask
+            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+            if attention_mask is not None:
+                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+                if attention_mask.shape[-1] > target_length:
+                    attention_mask = attention_mask[:, :target_length]
+                mask_length = attention_mask.shape[-1]
+                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(
+                    causal_mask.device
+                )
+                padding_mask = padding_mask == 0
+                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+                    padding_mask, min_dtype
+                )
+        return causal_mask
+
+
 
 @auto_docstring
 class Qwen3VLModel(Qwen3VLPreTrainedModel):
@@ -1695,9 +1912,6 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         video_grid_thw (`torch.LongTensor` of shape `(num_videos, 3)`, *optional*):
             The temporal, height and width of feature shape of each video in LLM.
         """
-        
-        # print(f"Qwen3VLModel.forward()开头 -> input_ids.shape = {input_ids.shape}")
-        
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -2087,12 +2301,10 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                         has_vid_id = q_completion_ids == self.config.video_token_id
                         if (has_img_id).any().item():
                             print('Edit tensors ({} image_token_id) for get_rope_index() function!'.format(torch.nonzero(has_img_id).shape[0]))
-                            exit(f"发现 get_per_token_logps() 生成了 image_token_id，请检查原因")
                             # q_completion_ids = q_completion_ids.masked_fill(has_img_id, self.config.vision_token_id)
                         if (has_vid_id).any().item():
                             print('Edit tensors ({} video_token_id) for get_rope_index() function!'.format(torch.nonzero(has_vid_id).shape[0]))
                             # q_completion_ids = q_completion_ids.masked_fill(has_vid_id, self.config.vision_token_id)
-                            exit(f"发现 get_per_token_logps() 生成了 video_token_id，请检查原因")
                         # temp_input_ids = torch.cat((sys_vis_ids, q_completion_ids), dim=1)
                     
                     # compute position_ids & rope_deltas
@@ -2153,15 +2365,8 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-        # import pdb; pdb.set_trace() 
-        # TODO: check boundaries: [[(14, 17)], 18, 145]
-            # boundaries = [[(20, 53), (60, 93), (100, 133), (141, 174), (182, 215), (223, 256), (264, 297), (305, 338)], 339, 435]
-            # inputs_embeds.shape = torch.Size([1, 435, 2048])
-        
-        initial_boundaries = copy.deepcopy(boundaries) # TODO: for rl_forward later use
-        
+        # import pdb; pdb.set_trace()
         # NOTE-ZY: qwen2.5vl video-r1用的 self.model(input_ids=None) -> 而qwen3vl的self.language_model(input_ids=None)
-        # print(f"self.language_model()开头 -> input_ids.shape = {input_ids.shape}\nboundaries={boundaries}")
         outputs = self.language_model( # NOTE-ZY: 对应video-r1 qwen2_5_vl_video_r1/modeling_qwen2_5_vl.py的self.model()
             input_ids=None,
             position_ids=position_ids, # torch.Size([3, 1, 330]) # NOTE-ZY: 已经是token merging的了
@@ -2184,9 +2389,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             run_our_forward=run_our_forward,
             is_prefill=is_prefill,
             rl_forward=rl_forward,
-            initial_boundaries=initial_boundaries, # TODO: pass initial boundaries for rl_forward later use
-            final_boundaries=boundaries,
-            input_ids=input_ids,
+            boundaries=boundaries,
         )
 
 
@@ -2222,7 +2425,6 @@ class Qwen3VLCausalLMOutputWithPast(ModelOutput):
     updated_attention_mask: Optional[torch.Tensor] = None
     updated_labels: Optional[torch.LongTensor] = None
     updated_logits: torch.FloatTensor = None
-    vision_token_count: Optional[int] = None
 
 
 class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
@@ -2299,7 +2501,6 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         """
         
         # import pdb; pdb.set_trace()
-        # print(f"Qwen3VLForConditionalGeneration.forward()开头 -> input_ids.shape = {input_ids.shape}")
         
         # NOTE-ZY: qwen2.5vl video-r1用的 self.model(input_ids=None) -> 而qwen3vl的self.language_model(input_ids=None)
         outputs = self.model( # 把merge后的token放进LLM 1/4 num tokens
@@ -2322,9 +2523,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         #     run_our_forward=run_our_forward,
         #     is_prefill=is_prefill,
         #     rl_forward=rl_forward,
-        #     initial_boundaries=initial_boundaries,
-        #     final_boundaries=boundaries,
-        #     input_ids=input_ids,
+        #     boundaries=boundaries,
         # )
 
         hidden_states = outputs[0]
@@ -2338,71 +2537,29 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
         if labels is not None:
             if outputs.run_our_forward: # 零散的辅助操作，比如modify data type
                 ##### NOTE: assume batch as 1 per device during training
-                assert labels.shape[0] == 1, f"Batch size > 1 (bs={labels.shape[0]}) 暂不支持"
-                boundary = outputs.initial_boundaries[0] # [[v_pairs...], q_start, num_tokens]
-                vision_boundaries_list = boundary[0] # [[v_start1, v_end1], ...]
-                segments_to_keep = []
-                last_kept_index = 0
-                current_labels = labels[0:1]
-                for v_start, v_end in vision_boundaries_list:
-                    segments_to_keep.append(current_labels[:, last_kept_index : v_start + 1]) # 保留 [last_kept_index : v_start + 1] (保留 <|vision_start|>)
-                    last_kept_index = v_end # 丢弃 (v_start, v_end) 之间, 即 [v_start + 1 : v_end] # 下一个保留的起始点是 v_end (<|vision_end|>)                
-                segments_to_keep.append(current_labels[:, last_kept_index:]) # 保留最后一个片段 (从最后一个 v_end 到序列末尾)
-                updated_labels = torch.cat(segments_to_keep, dim=-1)
-                labels = updated_labels # loss_function 将使用过滤后的 labels
-            
+                assert labels.shape[0] == 1
+                first_layer_input_b = self.model.boundaries_cache[0][0] # TODO: 此处也应该使用修改后的boundary定义，sft训练才会用到，先不管
+                labels = torch.cat((labels[:, :first_layer_input_b[0]], labels[:, first_layer_input_b[1]:]), dim=-1) 
+                updated_labels = labels
             # NOTE: Upcast to float if we need to compute the loss to avoid potential precision issues
+
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size)
 
         updated_input_ids = None # for RL
-        updated_logits = None # for RL; NOTE-ZY: not used
-        vision_token_count = 0
+        updated_logits = None # for RL
         if outputs.run_our_forward:
             if self.training: # NOTE: Upcast to float if we need to compute the loss to avoid potential precision issues (e.g., nan gradients)
                 logits = logits.float()
 
-            if outputs.rl_forward: # rl_forward = is_prefill and attention_mask is None
-                # RL stage get_per_token_logps() 
+            if outputs.rl_forward: # RL stage get_per_token_logps()
                 # remove visual tokens
-                                
-                assert outputs.input_ids.shape[0] == 1, f"Batch size > 1 (bs={outputs.input_ids.shape[0]}) 暂不支持"
-                # import pdb; pdb.set_trace() # NOTE-ZY: RL forward确实能进来
-                boundary = outputs.initial_boundaries # [[v_pairs...], q_start, num_tokens] # TODO: 用initial_boundaries来适配input_ids的vis boundary
-                    # TODO: input_ids.shape = torch.Size([1, 473])
-                    # outputs.input_ids.shape = torch.Size([1, 473])
-                    # torch.equal(input_ids, outputs.input_ids) = True
-                    # outputs.boundaries = [[(9, 43), (50, 84), (91, 125), (133, 167), (175, 209), (217, 251), (259, 293), (301, 335)], 336, 473]
-                vision_boundaries_list = boundary[0] # [[v_start1, v_end1], ...]
-                segments_ids = []
-                last_kept_index = 0
-                current_input_ids = outputs.input_ids[0:1] # 保持 batch 维度 (1, N)
-                for v_start, v_end in vision_boundaries_list:
-                    segments_ids.append(current_input_ids[:, last_kept_index : v_start + 1]) # 保留 [last_kept_index : v_start + 1] (保留 <|vision_start|>)
-                    last_kept_index = v_end # 丢弃 (v_start, v_end) 之间 # 下一个保留的起始点是 v_end (<|vision_end|>)
-                    vision_token_count += (v_end - v_start - 1) # TODO: 用于后续RL code计算去掉视觉token后的prompt_len = prompt_len-vision_token_count
-                segments_ids.append(current_input_ids[:, last_kept_index:]) # 保留最后一个片段
-                updated_input_ids = torch.cat(segments_ids, dim=-1)        
-                
-                # final_boundary = outputs.final_boundaries # [[v_pairs...], q_start, num_tokens]
-                # for v_start, v_end in final_boundary[0]:
-                     # count number of vision tokens
-                
-                # print(f"enter rl_forward (rl_forward = is_prefill and attention_mask is None) for RL stage get_per_token_logps()")
-                # print(f"outputs.initial_boundaries = {outputs.initial_boundaries}")
-                # print(f"outputs.final_boundaries = {outputs.final_boundaries}")
-                # print(f"input_ids.shape = {input_ids.shape}")
-                # print(f"outputs.input_ids.shape = {outputs.input_ids.shape}")
-                # print(f"updated_input_ids.shape = {updated_input_ids.shape}")
-                # print(f"logits.shape = {logits.shape}")
-                # enter rl_forward (rl_forward = is_prefill and attention_mask is None) for RL stage get_per_token_logps()
-                # outputs.boundaries = [[(9, 43), (50, 84), (91, 125), (133, 167), (175, 209), (217, 251), (259, 293), (301, 335)], 336, 473]
-                # input_ids.shape = torch.Size([1, 473])
-                # outputs.input_ids.shape = torch.Size([1, 473])
-                # updated_input_ids.shape = torch.Size([1, 209])
-                # logits.shape = torch.Size([1, 209, 151936])
-                # import pdb;pdb.set_trace() # TODO: 还是用video debug更方便check逻辑
+                ids_wo_vis = []
+                for b_i in range(input_ids.shape[0]):
+                    boundary = outputs.boundaries[b_i]
+                    ids_wo_vis_b = torch.cat((input_ids[b_i:b_i+1, :boundary[0]], input_ids[b_i:b_i+1, boundary[1]:]), dim=-1) # TODO: 此处也应该使用修改后的boundary定义，rl训练才会用到，先不管
+                    ids_wo_vis.append(ids_wo_vis_b)
+                updated_input_ids = torch.cat(ids_wo_vis, dim=0)
 
-                # TODO: return的boundary应该是最终的boundary？
 
         nan_exist = torch.isnan(logits).any().item()
         if nan_exist:
@@ -2422,11 +2579,11 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             logits=logits,
             past_key_values=outputs.past_key_values,
             rope_deltas=outputs.rope_deltas,
-            boundaries=outputs.final_boundaries, # TODO: pass final boundaries
+            boundaries=outputs.boundaries,
             updated_labels=updated_labels, # for SFT
             updated_input_ids=updated_input_ids, # for RL
             updated_logits=updated_logits, # for RL
-            vision_token_count=vision_token_count, # for RL
+
         )
 
     def prepare_inputs_for_generation(
@@ -2446,7 +2603,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
 
-        model_inputs = super().prepare_inputs_for_generation(
+        model_inputs = super().prepare_inputs_for_generation( # TODO: call GenerationMixin's prepare_inputs_for_generation?
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
@@ -2542,7 +2699,7 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             image_grid_thw = model_kwargs.get("image_grid_thw", None)
             video_grid_thw = model_kwargs.get("video_grid_thw", None)
             
-            ###### NOTE-ZY: fix qwen3vl use num_return_sequences > 1, refer to https://github.com/QwenLM/Qwen3-VL/issues/1621
+            ###### TODO: fix_zy: qwen3vl use num_return_sequences > 1, refer to https://github.com/QwenLM/Qwen3-VL/issues/1621
             # flatten video grid thw to 1D tensor
             if video_grid_thw is not None:
                 video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
@@ -2701,6 +2858,47 @@ def get_protected_info(boundaries, hidden_states):
      
     protected_inds = this_inds
     protected_num = torch.tensor([this_inds.shape[0]], dtype=protected_inds.dtype, device=protected_inds.device) # tensor([90], device='cuda:0')
+
+    return protected_inds, protected_num
+
+def get_protected_info_old_backup(boundaries, hidden_states):
+    """ Given the boundary of different types of tokens in a sequence, this function outputs 2D indices (B, N) to protect certain tokens.
+    protected_inds: all indices in a batch.
+    protected_num: number of tokens per sample in a batch.
+    """
+    # --------------------------------------------------------------------------------
+    # [函数作用总结]
+    #
+    # 这个函数的目的是找出并返回所有 "非视觉" token（即系统提示文本和问题文本）
+    # 在整个批次 (batch) 中的 2D 绝对索引。
+    #
+    # 它假设 `boundaries` 是一个 [B, 3] 的张量，格式为:
+    # [ [vis_start_idx_0, query_start_idx_0, total_len_0],  <- 批次 0
+    #   [vis_start_idx_1, query_start_idx_1, total_len_1],  <- 批次 1
+    #   ... ]
+    #
+    # 它通过选择 0 到 vis_start 和 query_start 到 total_len 的索引，
+    # 来“保护”文本 token，并“跳过”中间的 vis_start 到 query_start 的视觉 token。
+    # --------------------------------------------------------------------------------
+
+    # the indices of text tokens that should be protected
+    protected_inds = [] # protected_inds: 用于存储所有批次中，被保护 token 的 [batch_idx, token_idx] 坐标对
+    protected_num = [] # protected_num: 用于存储每个批次 (sample) 中，被保护 token 的 *数量*
+    for b_i in range(boundaries.size(0)):
+        this_bound = boundaries[b_i] # [system prompt text tokens, visual tokens, question tokens]
+        this_inds_col = torch.cat((torch.arange(0, this_bound[0]), torch.arange(this_bound[1], hidden_states[b_i].size(0)))).unsqueeze(1)
+            # --- 创建被保护 token 的“列索引” (token_idx) ---
+            # torch.arange(0, this_bound[0]): 选择系统提示 (System Prompt) token：从索引 0 到 vis_start (不含)
+            # torch.arange(this_bound[1], hidden_states[b_i].size(0)): 选择问题 (Question) token：从索引 query_start 到序列末尾
+        this_inds_row = torch.ones(this_inds_col.shape[0]).fill_(b_i).long().unsqueeze(1)
+        this_inds = torch.cat((this_inds_row, this_inds_col), dim=1)
+            # --- 组合坐标 ---
+            # 将 [N, 1] 的行索引和 [N, 1] 的列索引拼接为 [N, 2] 的坐标对
+            # 结果形如: [[b_i, 0], [b_i, 1], ..., [b_i, 251], [b_i, 252], ...]
+        protected_inds.append(this_inds)
+        protected_num.append(this_inds.shape[0])
+    protected_inds = torch.cat(protected_inds, dim=0).to(hidden_states.device)
+    protected_num = torch.tensor(protected_num, dtype=protected_inds.dtype, device=protected_inds.device)
 
     return protected_inds, protected_num
 

@@ -669,8 +669,6 @@ def _preprocess_mask_arguments(
     past_key_values: Optional[Cache],
     position_ids: Optional[torch.Tensor],
     layer_idx: Optional[int],
-    compression_prefill=False,
-    compression_decode=False,
 ) -> tuple[bool, Optional[Union[torch.Tensor, BlockMask]], int, int]:
     """
     Perform some common pre-processing of the mask arguments we get from the modeling code. Mostly determine the
@@ -725,9 +723,8 @@ def _preprocess_mask_arguments(
         attention_mask = attention_mask.to(device=cache_position.device, dtype=torch.bool)
 
     # If using a cache, it can give all information about mask sizes based on seen tokens
-    # import pdb; pdb.set_trace()
     if past_key_values is not None:
-        kv_length, kv_offset = past_key_values.get_mask_sizes(cache_position, layer_idx, compression_prefill=compression_prefill, compression_decode=compression_decode)
+        kv_length, kv_offset = past_key_values.get_mask_sizes(cache_position, layer_idx)
     # Otherwise, the sizes are simply the input sizes
     else:
         kv_length, kv_offset = input_embeds.shape[1], 0
@@ -754,8 +751,6 @@ def create_causal_mask(
     position_ids: Optional[torch.Tensor] = None,
     or_mask_function: Optional[Callable] = None,
     and_mask_function: Optional[Callable] = None,
-    compression_prefill=False,
-    compression_decode=False,
 ) -> Optional[Union[torch.Tensor, BlockMask]]:
     """
     Create a standard causal mask based on the attention implementation used (stored in the config). If `past_key_values`
@@ -791,7 +786,7 @@ def create_causal_mask(
         layer_idx = 0
 
     early_exit, attention_mask, packed_sequence_mask, kv_length, kv_offset = _preprocess_mask_arguments(
-        config, input_embeds, attention_mask, cache_position, past_key_values, position_ids, layer_idx, compression_prefill=compression_prefill, compression_decode=compression_decode
+        config, input_embeds, attention_mask, cache_position, past_key_values, position_ids, layer_idx
     )
     if early_exit:
         return attention_mask

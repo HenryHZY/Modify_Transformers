@@ -1,5 +1,7 @@
 .DS_Store
 **/.DS_Store
+visualization
+饼图柱状图
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
